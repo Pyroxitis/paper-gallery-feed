@@ -434,25 +434,46 @@ def image_metrics(gray: Image.Image) -> dict[str, float]:
     return {"mean": mean, "std": std, "white": white, "dark": dark, "mid": mid, "edge": edge_mean}
 
 
+def _content_mask_bbox(gray: Image.Image, size: tuple[int, int] = (320, 320)) -> tuple[tuple[int, int, int, int] | None, int, int]:
+    """Estimate the bbox of true content marks inside the artwork.
+
+    Unlike page-border detection, this tries to ignore the paper tone itself and
+    detect only darker marks/lines/printed regions. Using a fixed near-white
+    threshold was too permissive on aged paper scans, so we derive the threshold
+    from the brightest portion of the image.
+    """
+    small = gray.convert("L").resize(size, Image.Resampling.BILINEAR)
+    hist = small.histogram()
+    total = small.width * small.height
+    # 94th percentile brightness approximates paper/background on most scans.
+    cumulative = 0
+    bg = 255
+    target = int(total * 0.94)
+    for value, count in enumerate(hist):
+        cumulative += count
+        if cumulative >= target:
+            bg = value
+            break
+    threshold = max(170, min(242, bg - 18))
+    mask = small.point(lambda px: 255 if px < threshold else 0)
+    return mask.getbbox(), small.width, small.height
+
+
 def active_area_fraction(gray: Image.Image) -> float:
     """How much of the artwork rectangle is actually occupied by visible marks."""
-    small = gray.convert("L").resize((240, 240), Image.Resampling.BILINEAR)
-    mask = small.point(lambda p: 255 if p < 238 else 0)
-    bbox = mask.getbbox()
+    bbox, w, h = _content_mask_bbox(gray, (240, 240))
     if not bbox:
         return 0.0
     l, t, r, b = bbox
-    return ((r - l) * (b - t)) / float(small.width * small.height)
+    return ((r - l) * (b - t)) / float(w * h)
 
 
 def content_shape_metrics(gray: Image.Image) -> dict[str, float]:
     """Estimate the true active-content box inside the artwork sheet/scan."""
-    small = gray.convert("L").resize((320, 320), Image.Resampling.BILINEAR)
-    mask = small.point(lambda p: 255 if p < 238 else 0)
-    bbox = mask.getbbox()
+    bbox, sw, sh = _content_mask_bbox(gray, (320, 320))
     if not bbox:
         return {
-            "bbox": (0, 0, small.width, small.height),
+            "bbox": (0, 0, sw, sh),
             "width_fill": 0.0,
             "height_fill": 0.0,
             "area_fill": 0.0,
@@ -464,11 +485,11 @@ def content_shape_metrics(gray: Image.Image) -> dict[str, float]:
     l, t, r, b = bbox
     bw = max(1, r - l)
     bh = max(1, b - t)
-    width_fill = bw / float(small.width)
-    height_fill = bh / float(small.height)
-    area_fill = (bw * bh) / float(small.width * small.height)
-    center_x = (l + r) / 2.0 / small.width
-    center_y = (t + b) / 2.0 / small.height
+    width_fill = bw / float(sw)
+    height_fill = bh / float(sh)
+    area_fill = (bw * bh) / float(sw * sh)
+    center_x = (l + r) / 2.0 / sw
+    center_y = (t + b) / 2.0 / sh
     return {
         "bbox": bbox,
         "width_fill": width_fill,
@@ -982,7 +1003,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         f"source={src}",
         f"mode={c.mode}",
         f"orientation={c.orientation}",
-        f"aspect={c.aspect_ratio:.2f}",
+        f"ratio={c.active_aspect:.2f}",
         f"ink={ink * 100:.1f}",
         f"content_ink={c.preview_content_ink * 100:.1f}",
         f"bytes={len(packed)}",
@@ -1000,7 +1021,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         "source": src,
         "mode": c.mode,
         "orientation": c.orientation,
-        "aspect": round(c.aspect_ratio, 2),
+        "ratio": round(c.active_aspect, 2),
         "ink": round(ink * 100, 1),
         "content_ink": round(c.preview_content_ink * 100, 1),
         "bytes": len(packed),
