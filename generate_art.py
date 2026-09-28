@@ -20,6 +20,7 @@ import json
 import math
 import random
 import statistics
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,6 +125,7 @@ class Candidate:
     visual_score: float = 0.0
     mode: str = "atkinson"
     content_box: tuple[int, int, int, int] | None = None
+    active_box: tuple[int, int, int, int] | None = None
     preview_bw: Image.Image | None = None
     preview_ink: float = 0.0
     preview_content_ink: float = 0.0
@@ -414,11 +416,6 @@ def contain_on_canvas_with_box(gray: Image.Image) -> tuple[Image.Image, tuple[in
     return canvas, (x, y, x + im.width, y + im.height)
 
 
-def contain_on_canvas(gray: Image.Image) -> Image.Image:
-    canvas, _ = contain_on_canvas_with_box(gray)
-    return canvas
-
-
 def image_metrics(gray: Image.Image) -> dict[str, float]:
     small = gray.convert("L").resize((200, 120), Image.Resampling.BILINEAR)
     stat = ImageStat.Stat(small)
@@ -434,46 +431,87 @@ def image_metrics(gray: Image.Image) -> dict[str, float]:
     return {"mean": mean, "std": std, "white": white, "dark": dark, "mid": mid, "edge": edge_mean}
 
 
-def _content_mask_bbox(gray: Image.Image, size: tuple[int, int] = (320, 320)) -> tuple[tuple[int, int, int, int] | None, int, int]:
-    """Estimate the bbox of true content marks inside the artwork.
+def _content_mask_bbox(
+    gray: Image.Image,
+    size: tuple[int, int] = (320, 320),
+    trim_fraction: float = 0.01,
+) -> tuple[tuple[int, int, int, int] | None, int, int]:
+    """Estimate a robust bounding box for visible marks on the sheet.
 
-    Unlike page-border detection, this tries to ignore the paper tone itself and
-    detect only darker marks/lines/printed regions. Using a fixed near-white
-    threshold was too permissive on aged paper scans, so we derive the threshold
-    from the brightest portion of the image.
+    The analysis image may be resized non-uniformly for speed, but bbox values
+    are returned in that analysis coordinate system and later converted back to
+    source-relative fractions. Sparse dust/speckle outliers are ignored by
+    trimming a small fraction of dark pixels from each edge of the distribution.
     """
     small = gray.convert("L").resize(size, Image.Resampling.BILINEAR)
     hist = small.histogram()
     total = small.width * small.height
-    # 94th percentile brightness approximates paper/background on most scans.
+
+    # Estimate paper/background from a high brightness percentile, then look for
+    # marks meaningfully darker than that background. This behaves better than a
+    # fixed threshold on cream/aged paper scans.
     cumulative = 0
     bg = 255
-    target = int(total * 0.94)
+    target = max(1, int(total * 0.94))
     for value, count in enumerate(hist):
         cumulative += count
         if cumulative >= target:
             bg = value
             break
-    threshold = max(170, min(242, bg - 18))
-    mask = small.point(lambda px: 255 if px < threshold else 0)
-    return mask.getbbox(), small.width, small.height
+    threshold = max(165, min(242, bg - 18))
 
+    data = small.tobytes()
+    col_counts = [0] * small.width
+    row_counts = [0] * small.height
+    dark_total = 0
+    for y in range(small.height):
+        row = y * small.width
+        for x in range(small.width):
+            if data[row + x] < threshold:
+                col_counts[x] += 1
+                row_counts[y] += 1
+                dark_total += 1
 
-def active_area_fraction(gray: Image.Image) -> float:
-    """How much of the artwork rectangle is actually occupied by visible marks."""
-    bbox, w, h = _content_mask_bbox(gray, (240, 240))
-    if not bbox:
-        return 0.0
-    l, t, r, b = bbox
-    return ((r - l) * (b - t)) / float(w * h)
+    if dark_total < 8:
+        return None, small.width, small.height
+
+    trim = max(0, int(dark_total * trim_fraction))
+
+    def lower_bound(counts: list[int]) -> int:
+        acc = 0
+        for idx, count in enumerate(counts):
+            acc += count
+            if acc > trim:
+                return idx
+        return 0
+
+    def upper_bound(counts: list[int]) -> int:
+        acc = 0
+        for idx in range(len(counts) - 1, -1, -1):
+            acc += counts[idx]
+            if acc > trim:
+                return idx + 1
+        return len(counts)
+
+    l = lower_bound(col_counts)
+    r = upper_bound(col_counts)
+    t = lower_bound(row_counts)
+    b = upper_bound(row_counts)
+    if r <= l or b <= t:
+        return None, small.width, small.height
+    return (l, t, r, b), small.width, small.height
 
 
 def content_shape_metrics(gray: Image.Image) -> dict[str, float]:
-    """Estimate the true active-content box inside the artwork sheet/scan."""
+    """Measure the actual visible-content footprint inside an artwork scan."""
     bbox, sw, sh = _content_mask_bbox(gray, (320, 320))
     if not bbox:
         return {
             "bbox": (0, 0, sw, sh),
+            "left_frac": 0.0,
+            "top_frac": 0.0,
+            "right_frac": 1.0,
+            "bottom_frac": 1.0,
             "width_fill": 0.0,
             "height_fill": 0.0,
             "area_fill": 0.0,
@@ -483,231 +521,32 @@ def content_shape_metrics(gray: Image.Image) -> dict[str, float]:
         }
 
     l, t, r, b = bbox
-    bw = max(1, r - l)
-    bh = max(1, b - t)
-    width_fill = bw / float(sw)
-    height_fill = bh / float(sh)
-    area_fill = (bw * bh) / float(sw * sh)
-    center_x = (l + r) / 2.0 / sw
-    center_y = (t + b) / 2.0 / sh
+    width_frac = max(1, r - l) / float(sw)
+    height_frac = max(1, b - t) / float(sh)
+    left_frac = l / float(sw)
+    right_frac = r / float(sw)
+    top_frac = t / float(sh)
+    bottom_frac = b / float(sh)
+
+    # Correct for the source sheet's real aspect ratio. Measuring the bbox on a
+    # square analysis bitmap without this correction was the reason many wide
+    # works were previously mislabeled as ~1:1.
+    source_aspect = gray.width / float(max(1, gray.height))
+    active_aspect = (width_frac * source_aspect) / max(height_frac, 1e-6)
+
     return {
         "bbox": bbox,
-        "width_fill": width_fill,
-        "height_fill": height_fill,
-        "area_fill": area_fill,
-        "aspect": bw / float(bh),
-        "center_x": center_x,
-        "center_y": center_y,
+        "left_frac": left_frac,
+        "top_frac": top_frac,
+        "right_frac": right_frac,
+        "bottom_frac": bottom_frac,
+        "width_fill": width_frac,
+        "height_fill": height_frac,
+        "area_fill": width_frac * height_frac,
+        "aspect": active_aspect,
+        "center_x": (left_frac + right_frac) / 2.0,
+        "center_y": (top_frac + bottom_frac) / 2.0,
     }
-
-
-def orientation_from_ratio(ratio: float) -> str:
-    if ratio >= 1.15:
-        return "horizontal"
-    if ratio < 0.90:
-        return "vertical"
-    return "square"
-
-
-def visual_score(metrics: dict[str, float]) -> float:
-    """Score how naturally an artwork should survive 1-bit e-paper conversion.
-
-    Paper Gallery deliberately prefers crisp drawings with visible paper and
-    moderate structure. Very dark, muddy, or very flat/low-contrast images are
-    penalized.
-    """
-    score = 0.0
-    score += min(metrics["white"], 0.88) * 110
-    score += min(metrics["edge"] / 28.0, 1.6) * 52
-    score += min(metrics["std"] / 58.0, 1.5) * 40
-
-    if metrics["dark"] > 0.17:
-        score -= (metrics["dark"] - 0.17) * 420
-    if metrics["mean"] < 168:
-        score -= (168 - metrics["mean"]) * 1.8
-    if metrics["mid"] > 0.50:
-        score -= (metrics["mid"] - 0.50) * 140
-    if metrics["white"] < 0.22:
-        score -= 60
-    if metrics["std"] < 24:
-        score -= (24 - metrics["std"]) * 1.6
-    return score
-
-def choose_mode(metrics: dict[str, float], blob: str) -> str:
-    line_keywords = (
-        "architectural",
-        "botanical",
-        "pen and ink",
-        "pen & ink",
-        "graphite",
-        "drawing",
-        "woodcut",
-        "wood engraving",
-        "illustration",
-        "scientific",
-    )
-    tonal_keywords = ("mezzotint", "aquatint", "tonal", "wash", "charcoal")
-    if any(k in blob for k in line_keywords):
-        return "line"
-    if any(k in blob for k in tonal_keywords) and metrics["mid"] > 0.28:
-        return "atkinson"
-    if metrics["white"] > 0.26 and metrics["mid"] < 0.34:
-        return "line"
-    if metrics["std"] < 24 and metrics["mid"] > 0.28:
-        return "atkinson"
-    if metrics["dark"] < 0.12 and metrics["edge"] > 11:
-        return "line"
-    return "line"
-
-
-def auto_levels(gray: Image.Image) -> Image.Image:
-    # Gentle normalization. Heavy autocontrast makes aged paper and pale wash
-    # turn into dark texture on a 1-bit screen.
-    return ImageOps.autocontrast(gray.convert("L"), cutoff=(0.25, 0.25))
-
-
-def lift_midtones(gray: Image.Image, gamma: float = 0.76, offset: int = 6) -> Image.Image:
-    """Brighten paper/midtones while leaving genuinely dark ink recognizable."""
-    if gamma <= 0:
-        raise ValueError("gamma must be positive")
-    lut = []
-    for i in range(256):
-        v = 255.0 * ((i / 255.0) ** gamma) + offset
-        lut.append(max(0, min(255, round(v))))
-    return gray.convert("L").point(lut)
-
-
-def boost_contrast(gray: Image.Image, contrast: float = 1.12, sharpen: float = 1.06) -> Image.Image:
-    g = ImageEnhance.Contrast(gray.convert("L")).enhance(contrast)
-    g = g.filter(ImageFilter.UnsharpMask(radius=0.8, percent=int((sharpen - 1.0) * 100 + 95), threshold=3))
-    return g
-
-
-def line_art(
-    gray: Image.Image,
-    *,
-    gamma: float = 0.72,
-    offset: int = 8,
-    local_gap: int = 48,
-    contrast: float = 1.12,
-) -> Image.Image:
-    """Render clean drawings with intentionally restrained black coverage."""
-    g = boost_contrast(lift_midtones(auto_levels(gray), gamma=gamma, offset=offset), contrast=contrast)
-
-    local = g.filter(ImageFilter.GaussianBlur(radius=5.0))
-    a = g.tobytes()
-    b = local.tobytes()
-    out = bytearray(len(a))
-    for i, (p, bg) in enumerate(zip(a, b)):
-        threshold = max(112, min(204, bg - local_gap))
-        out[i] = 255 if p >= threshold else 0
-    return Image.frombytes("L", g.size, bytes(out)).convert("1", dither=Image.Dither.NONE)
-
-
-def atkinson(
-    gray: Image.Image,
-    *,
-    gamma: float = 0.78,
-    offset: int = 6,
-    threshold: float = 116.0,
-    contrast: float = 1.08,
-) -> Image.Image:
-    """Light-biased Atkinson dithering for engravings and tonal prints."""
-    g = boost_contrast(lift_midtones(auto_levels(gray), gamma=gamma, offset=offset), contrast=contrast)
-    w, h = g.size
-    px = [float(v) for v in g.tobytes()]
-
-    for y in range(h):
-        row = y * w
-        for x in range(w):
-            i = row + x
-            old = px[i]
-            new = 255.0 if old >= threshold else 0.0
-            px[i] = new
-            error = (old - new) / 8.0
-            for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    j = ny * w + nx
-                    px[j] = min(255.0, max(0.0, px[j] + error))
-
-    data = bytes(255 if v >= threshold else 0 for v in px)
-    return Image.frombytes("L", (w, h), data).convert("1", dither=Image.Dither.NONE)
-
-
-def black_fraction(
-    gray: Image.Image,
-    *,
-    gamma: float = 0.78,
-    offset: int = 6,
-    threshold: float = 116.0,
-) -> Image.Image:
-    """Light-biased Atkinson dithering for engravings and tonal prints."""
-    g = lift_midtones(auto_levels(gray), gamma=gamma, offset=offset)
-    w, h = g.size
-    px = [float(v) for v in g.tobytes()]
-
-    # A threshold below 128 intentionally biases the result toward white. On
-    # monochrome e-paper this preserves the look of paper instead of allowing
-    # gray engraving tone to collapse into large black regions.
-    for y in range(h):
-        row = y * w
-        for x in range(w):
-            i = row + x
-            old = px[i]
-            new = 255.0 if old >= threshold else 0.0
-            px[i] = new
-            error = (old - new) / 8.0
-            for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    j = ny * w + nx
-                    px[j] = min(255.0, max(0.0, px[j] + error))
-
-    data = bytes(255 if v >= threshold else 0 for v in px)
-    return Image.frombytes("L", (w, h), data).convert("1", dither=Image.Dither.NONE)
-
-
-def black_fraction(img1: Image.Image) -> float:
-    """Fraction of the final frame that is black ink (0.0 to 1.0)."""
-    hist = img1.convert("1").histogram()
-    black = hist[0] if hist else 0
-    total = img1.width * img1.height
-    return black / total if total else 0.0
-
-
-def black_fraction_in_box(img1: Image.Image, box: tuple[int, int, int, int] | None) -> float:
-    """Black coverage inside the fitted artwork area, excluding white frame margins."""
-    if box is None:
-        return black_fraction(img1)
-    l, t, r, b = box
-    l, t = max(0, l), max(0, t)
-    r, b = min(img1.width, r), min(img1.height, b)
-    if r <= l or b <= t:
-        return black_fraction(img1)
-    return black_fraction(img1.crop((l, t, r, b)))
-
-def pack_1bpp(img1: Image.Image) -> bytes:
-    """Pack an 800x480 1-bit frame row-major, MSB-first.
-
-    Paper Gallery's feed convention is 1=white/background and 0=black/ink.
-    """
-    im = img1.convert("1")
-    if im.size != (W, H):
-        raise ValueError(f"frame must be {W}x{H}, got {im.width}x{im.height}")
-
-    pixels = im.load()
-    out = bytearray(FRAME_BYTES)
-    k = 0
-    for y in range(H):
-        for x0 in range(0, W, 8):
-            value = 0
-            for bit in range(8):
-                if pixels[x0 + bit, y] != 0:
-                    value |= 1 << (7 - bit)
-            out[k] = value
-            k += 1
-    return bytes(out)
 
 
 def classify_orientation(ratio: float) -> str:
@@ -737,6 +576,219 @@ def aspect_score(ratio: float) -> float:
     return -12.0
 
 
+def visual_score(metrics: dict[str, float]) -> float:
+    """Score how naturally an artwork should survive 1-bit e-paper conversion."""
+    score = 0.0
+    score += min(metrics["white"], 0.88) * 110
+    score += min(metrics["edge"] / 28.0, 1.6) * 52
+    score += min(metrics["std"] / 58.0, 1.5) * 40
+
+    if metrics["dark"] > 0.17:
+        score -= (metrics["dark"] - 0.17) * 420
+    if metrics["mean"] < 168:
+        score -= (168 - metrics["mean"]) * 1.8
+    if metrics["mid"] > 0.50:
+        score -= (metrics["mid"] - 0.50) * 140
+    if metrics["white"] < 0.22:
+        score -= 60
+    if metrics["std"] < 24:
+        score -= (24 - metrics["std"]) * 1.6
+    return score
+
+
+def choose_mode(metrics: dict[str, float], blob: str) -> str:
+    line_keywords = (
+        "architectural",
+        "botanical",
+        "pen and ink",
+        "pen & ink",
+        "graphite",
+        "drawing",
+        "woodcut",
+        "wood engraving",
+        "illustration",
+        "scientific",
+    )
+    tonal_keywords = ("mezzotint", "aquatint", "tonal", "wash", "charcoal")
+    if any(k in blob for k in line_keywords):
+        return "line"
+    if any(k in blob for k in tonal_keywords) and metrics["mid"] > 0.28:
+        return "atkinson"
+    if metrics["white"] > 0.26 and metrics["mid"] < 0.34:
+        return "line"
+    if metrics["std"] < 24 and metrics["mid"] > 0.28:
+        return "atkinson"
+    if metrics["dark"] < 0.12 and metrics["edge"] > 11:
+        return "line"
+    return "line"
+
+
+def auto_levels(gray: Image.Image) -> Image.Image:
+    return ImageOps.autocontrast(gray.convert("L"), cutoff=(0.25, 0.25))
+
+
+def lift_midtones(gray: Image.Image, gamma: float = 0.76, offset: int = 6) -> Image.Image:
+    """Brighten paper/midtones while leaving genuinely dark ink recognizable."""
+    if gamma <= 0:
+        raise ValueError("gamma must be positive")
+    lut = []
+    for i in range(256):
+        v = 255.0 * ((i / 255.0) ** gamma) + offset
+        lut.append(max(0, min(255, round(v))))
+    return gray.convert("L").point(lut)
+
+
+def boost_contrast(gray: Image.Image, contrast: float = 1.12, sharpen: float = 1.06) -> Image.Image:
+    g = ImageEnhance.Contrast(gray.convert("L")).enhance(contrast)
+    percent = max(1, int((sharpen - 1.0) * 100 + 95))
+    return g.filter(ImageFilter.UnsharpMask(radius=0.8, percent=percent, threshold=3))
+
+
+def line_art(
+    gray: Image.Image,
+    *,
+    gamma: float = 0.72,
+    offset: int = 8,
+    local_gap: int = 48,
+    contrast: float = 1.12,
+) -> Image.Image:
+    """Render clean drawings with restrained black coverage."""
+    g = boost_contrast(lift_midtones(auto_levels(gray), gamma=gamma, offset=offset), contrast=contrast)
+    local = g.filter(ImageFilter.GaussianBlur(radius=5.0))
+    a = g.tobytes()
+    b = local.tobytes()
+    out = bytearray(len(a))
+    for i, (pixel, background) in enumerate(zip(a, b)):
+        threshold = max(112, min(204, background - local_gap))
+        out[i] = 255 if pixel >= threshold else 0
+    return Image.frombytes("L", g.size, bytes(out)).convert("1", dither=Image.Dither.NONE)
+
+
+def atkinson(
+    gray: Image.Image,
+    *,
+    gamma: float = 0.78,
+    offset: int = 6,
+    threshold: float = 116.0,
+    contrast: float = 1.08,
+) -> Image.Image:
+    """Light-biased Atkinson dithering for engravings and tonal prints."""
+    g = boost_contrast(lift_midtones(auto_levels(gray), gamma=gamma, offset=offset), contrast=contrast)
+    w, h = g.size
+    px = [float(v) for v in g.tobytes()]
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            i = row + x
+            old = px[i]
+            new = 255.0 if old >= threshold else 0.0
+            px[i] = new
+            error = (old - new) / 8.0
+            for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    j = ny * w + nx
+                    px[j] = min(255.0, max(0.0, px[j] + error))
+    data = bytes(255 if v >= threshold else 0 for v in px)
+    return Image.frombytes("L", (w, h), data).convert("1", dither=Image.Dither.NONE)
+
+
+def black_fraction(img1: Image.Image) -> float:
+    """Fraction of a 1-bit image that is black ink (0.0 to 1.0)."""
+    hist = img1.convert("1").histogram()
+    black = hist[0] if hist else 0
+    total = img1.width * img1.height
+    return black / total if total else 0.0
+
+
+def black_fraction_in_box(img1: Image.Image, box: tuple[int, int, int, int] | None) -> float:
+    """Black coverage inside a supplied image box."""
+    if box is None:
+        return black_fraction(img1)
+    l, t, r, b = box
+    l, t = max(0, l), max(0, t)
+    r, b = min(img1.width, r), min(img1.height, b)
+    if r <= l or b <= t:
+        return black_fraction(img1)
+    return black_fraction(img1.crop((l, t, r, b)))
+
+
+def pack_1bpp(img1: Image.Image) -> bytes:
+    """Pack an 800x480 1-bit frame row-major, MSB-first; 1=white, 0=black."""
+    im = img1.convert("1")
+    if im.size != (W, H):
+        raise ValueError(f"frame must be {W}x{H}, got {im.width}x{im.height}")
+    pixels = im.load()
+    out = bytearray(FRAME_BYTES)
+    k = 0
+    for y in range(H):
+        for x0 in range(0, W, 8):
+            value = 0
+            for bit in range(8):
+                if pixels[x0 + bit, y] != 0:
+                    value |= 1 << (7 - bit)
+            out[k] = value
+            k += 1
+    return bytes(out)
+
+
+def select_pack(evaluated: list[Candidate], count: int) -> list[Candidate]:
+    """Choose the final pack, strongly favoring horizontal active content."""
+    if count <= 0:
+        return []
+
+    ranked = sorted(evaluated, key=lambda c: c.score, reverse=True)
+    horizontals = [c for c in ranked if c.orientation == "horizontal"]
+    squares = [c for c in ranked if c.orientation == "square"]
+    verticals = [c for c in ranked if c.orientation == "vertical"]
+
+    min_horizontal = max(1, min(count, math.ceil(count * 0.625)))
+    target_horizontal = max(min_horizontal, min(count, round(count * 0.75)))
+    max_vertical = 1 if count >= 6 else 0
+
+    selected: list[Candidate] = []
+    selected_ids: set[str] = set()
+    artist_keys: set[str] = set()
+
+    def try_add(pool: list[Candidate], limit: int | None = None, enforce_artist_diversity: bool = True) -> None:
+        added = 0
+        for cand in pool:
+            if cand.id in selected_ids:
+                continue
+            artist = clean_text(cand.raw.get("artist_title") or cand.raw.get("artist_display"), "Unknown artist")
+            key = artist.casefold()
+            if enforce_artist_diversity and key in artist_keys and len(selected) < max(4, count // 2):
+                continue
+            selected.append(cand)
+            selected_ids.add(cand.id)
+            artist_keys.add(key)
+            added += 1
+            if limit is not None and added >= limit:
+                break
+            if len(selected) >= count:
+                break
+
+    try_add(horizontals, target_horizontal)
+    horizontal_count = sum(c.orientation == "horizontal" for c in selected)
+    if horizontal_count < min_horizontal:
+        # Relax artist diversity before sacrificing the desired frame orientation.
+        try_add(horizontals, min_horizontal - horizontal_count, enforce_artist_diversity=False)
+
+    remaining = count - len(selected)
+    if remaining > 0:
+        try_add(squares, remaining)
+    remaining = count - len(selected)
+    if remaining > 0 and max_vertical > 0:
+        try_add(verticals, min(max_vertical, remaining))
+    remaining = count - len(selected)
+    if remaining > 0:
+        # Final safety fill: quality order wins if the strict mix cannot produce
+        # a complete pack. This avoids a failed daily build solely due to aspect.
+        try_add(ranked, remaining, enforce_artist_diversity=False)
+
+    return selected[:count]
+
+
 def evaluate_candidates(session: requests.Session, candidates: list[Candidate], count: int) -> list[Candidate]:
     """Download, render and rank candidates for a light, paper-like e-paper result."""
     max_to_try = min(len(candidates), max(count * 18, 96))
@@ -748,7 +800,7 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             cropped = crop_scan_border(ImageOps.grayscale(image))
             metrics = image_metrics(cropped)
             shape = content_shape_metrics(cropped)
-            active_fraction = active_area_fraction(cropped)
+            active_fraction = float(shape["area_fill"])
 
             c.source_aspect = cropped.width / float(max(1, cropped.height))
             c.active_aspect = float(shape["aspect"])
@@ -757,7 +809,7 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             c.active_area_fill = float(shape["area_fill"])
             c.active_center_x = float(shape["center_x"])
             c.active_center_y = float(shape["center_y"])
-            c.orientation = orientation_from_ratio(c.active_aspect)
+            c.orientation = classify_orientation(c.active_aspect)
 
             title = clean_text(c.raw.get("title"), "Untitled")
 
@@ -782,23 +834,22 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
 
             canvas, box = contain_on_canvas_with_box(cropped)
             c.content_box = box
+            x0, y0, x1, y1 = box
+            fitted_w = x1 - x0
+            fitted_h = y1 - y0
+            c.active_box = (
+                x0 + round(float(shape["left_frac"]) * fitted_w),
+                y0 + round(float(shape["top_frac"]) * fitted_h),
+                x0 + round(float(shape["right_frac"]) * fitted_w),
+                y0 + round(float(shape["bottom_frac"]) * fitted_h),
+            )
             c.visual_score = visual_score(metrics)
             c.mode = choose_mode(metrics, metadata_blob(c.raw))
             c.score += c.visual_score
             c.image = canvas.convert("RGB")
 
             # Aspect/orientation preference based on the actual active content.
-            ar = c.active_aspect
-            if 1.35 <= ar <= 2.40:
-                c.score += 32
-            elif 1.15 <= ar < 1.35 or 2.40 < ar <= 2.90:
-                c.score += 22
-            elif 0.90 <= ar < 1.15:
-                c.score += 6
-            elif 0.72 <= ar < 0.90:
-                c.score -= 14
-            else:
-                c.score -= 34
+            c.score += aspect_score(c.active_aspect)
 
             # Prefer content that actually spreads across the horizontal frame.
             c.score += max(0.0, c.active_width_fill - 0.58) * 70
@@ -854,55 +905,7 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             break
 
     evaluated.sort(key=lambda c: c.score, reverse=True)
-
-    # Build a pack that strongly favors horizontal active content.
-    horizontals = [c for c in evaluated if c.orientation == "horizontal"]
-    squares = [c for c in evaluated if c.orientation == "square"]
-    verticals = [c for c in evaluated if c.orientation == "vertical"]
-
-    min_horizontal = max(1, min(count, math.ceil(count * 0.625)))
-    target_horizontal = max(min_horizontal, min(count, round(count * 0.75)))
-    max_vertical = 1 if count >= 6 else 0
-
-    selected: list[Candidate] = []
-    selected_ids: set[str] = set()
-    artist_keys: set[str] = set()
-
-    def try_add(pool: list[Candidate], limit: int | None = None) -> None:
-        added = 0
-        for cand in pool:
-            if cand.id in selected_ids:
-                continue
-            artist = clean_text(cand.raw.get("artist_title") or cand.raw.get("artist_display"), "Unknown artist")
-            key = artist.casefold()
-            # Preserve artist diversity while the pack is still being assembled.
-            if key in artist_keys and len(selected) < max(4, count // 2):
-                continue
-            selected.append(cand)
-            selected_ids.add(cand.id)
-            artist_keys.add(key)
-            added += 1
-            if limit is not None and added >= limit:
-                break
-            if len(selected) >= count:
-                break
-
-    try_add(horizontals, target_horizontal)
-    if len([c for c in selected if c.orientation == "horizontal"]) < min_horizontal:
-        # If we still somehow missed the minimum, keep pulling horizontals.
-        try_add(horizontals, min_horizontal - len([c for c in selected if c.orientation == "horizontal"]))
-
-    remaining = count - len(selected)
-    if remaining > 0:
-        try_add(squares, remaining)
-    remaining = count - len(selected)
-    if remaining > 0 and max_vertical > 0:
-        try_add(verticals, min(max_vertical, remaining))
-    remaining = count - len(selected)
-    if remaining > 0:
-        try_add(horizontals + squares + verticals, remaining)
-
-    return selected[:count]
+    return select_pack(evaluated, count)
 
 
 def render_candidate(c: Candidate) -> tuple[Image.Image, bytes, float]:
@@ -938,7 +941,7 @@ def render_candidate(c: Candidate) -> tuple[Image.Image, bytes, float]:
     best_score = float('inf')
     for attempt in rendered:
         attempt_ink = black_fraction(attempt)
-        attempt_content = black_fraction_in_box(attempt, c.content_box)
+        attempt_content = black_fraction_in_box(attempt, c.active_box or c.content_box)
         penalty = 0.0
         # Strong penalties outside the acceptable bands.
         if attempt_ink < global_min:
@@ -1004,6 +1007,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         f"mode={c.mode}",
         f"orientation={c.orientation}",
         f"ratio={c.active_aspect:.2f}",
+        f"width_fill={c.active_width_fill * 100:.1f}",
         f"ink={ink * 100:.1f}",
         f"content_ink={c.preview_content_ink * 100:.1f}",
         f"bytes={len(packed)}",
@@ -1022,6 +1026,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         "mode": c.mode,
         "orientation": c.orientation,
         "ratio": round(c.active_aspect, 2),
+        "width_fill": round(c.active_width_fill * 100, 1),
         "ink": round(ink * 100, 1),
         "content_ink": round(c.preview_content_ink * 100, 1),
         "bytes": len(packed),
@@ -1031,21 +1036,24 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
 
 def write_gallery_html(site_dir: Path, pack: str, works: list[dict[str, Any]]) -> None:
     cards: list[str] = []
+    generated_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
     for work in works:
         title = html.escape(str(work["title"]), quote=True)
         artist = html.escape(str(work["artist"]), quote=True)
         date = html.escape(str(work["date"]), quote=True)
         mode = html.escape(str(work["mode"]), quote=True)
         orientation = html.escape(str(work.get("orientation", "?")), quote=True)
-        aspect = html.escape(str(work.get("aspect", "?")), quote=True)
+        ratio = html.escape(str(work.get("ratio", "?")), quote=True)
+        width_fill = html.escape(str(work.get("width_fill", "?")), quote=True)
         ink = html.escape(str(work.get("ink", "?")), quote=True)
         content_ink = html.escape(str(work.get("content_ink", "?")), quote=True)
+        crc = html.escape(str(work.get("crc32", "0")), quote=True)
         source = html.escape(str(work["source"]), quote=True)
         slot = int(work["slot"])
         cards.append(
-            f'<article><img src="feed/slot{slot}.png" alt="{title}">'
+            f'<article><img src="feed/slot{slot}.png?v={crc}" alt="{title}">'
             f"<h2>{title}</h2><p>{artist}</p>"
-            f'<p class="muted">{date} · {orientation} {aspect}:1 · {mode} · {ink}% frame ink · {content_ink}% artwork ink</p>'
+            f'<p class="muted">{date} · {orientation} {ratio}:1 · {mode} · {width_fill}% width fill · {ink}% frame ink · {content_ink}% artwork ink</p>'
             f'<a href="{source}" rel="noopener">Museum record</a></article>'
         )
 
@@ -1054,6 +1062,9 @@ def write_gallery_html(site_dir: Path, pack: str, works: list[dict[str, Any]]) -
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Paper Gallery feed</title>
 <style>
 body{{font-family:system-ui,sans-serif;background:#f3f0e8;color:#171717;margin:0}}
@@ -1071,6 +1082,7 @@ a{{color:#171717}}
 <p>PAPER GALLERY</p>
 <h1>Daily public-domain art pack</h1>
 <p>Pack {html.escape(pack, quote=True)} · {html.escape(MUSEUM, quote=True)} CC0 Open Access works.</p>
+<p class="muted">Generated {html.escape(generated_at, quote=True)} UTC</p>
 <div class="grid">{''.join(cards)}</div>
 </main></body></html>
 """
@@ -1107,6 +1119,13 @@ def generate(output: Path, site_dir: Path, count: int, date_str: str | None = No
 
     output.mkdir(parents=True, exist_ok=True)
     site_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove only files generated by this script. This prevents stale slot files
+    # from older runs if the requested pack size is reduced.
+    for pattern in ("slot*.bin", "slot*.png", "slot*.txt", "index.txt", "index.json"):
+        for old_file in output.glob(pattern):
+            if old_file.is_file():
+                old_file.unlink()
 
     works = [write_slot(output, pack, i, count, c) for i, c in enumerate(selected)]
     (output / "index.txt").write_text(f"PG1\npack={pack}\ncount={count}\n", encoding="utf-8")
@@ -1153,6 +1172,50 @@ def self_test() -> None:
     assert classify_orientation(0.75) == "vertical"
     assert aspect_score(1.60) > aspect_score(1.00) > aspect_score(0.75)
 
+    # Pack selection should choose at least five horizontals for an eight-work
+    # pack when enough suitable horizontal candidates are available.
+    pack_candidates: list[Candidate] = []
+    for i in range(6):
+        work = dict(normalized)
+        work["id"] = 1000 + i
+        work["accession_number"] = f"H{i}"
+        work["artist_title"] = f"Horizontal Artist {i}"
+        pack_candidates.append(Candidate(work, 200 - i, "test", orientation="horizontal", active_aspect=1.6))
+    for i in range(3):
+        work = dict(normalized)
+        work["id"] = 2000 + i
+        work["accession_number"] = f"S{i}"
+        work["artist_title"] = f"Square Artist {i}"
+        pack_candidates.append(Candidate(work, 190 - i, "test", orientation="square", active_aspect=1.0))
+    for i in range(2):
+        work = dict(normalized)
+        work["id"] = 3000 + i
+        work["accession_number"] = f"V{i}"
+        work["artist_title"] = f"Vertical Artist {i}"
+        pack_candidates.append(Candidate(work, 210 - i, "test", orientation="vertical", active_aspect=0.7))
+    chosen = select_pack(pack_candidates, 8)
+    assert len(chosen) == 8
+    assert sum(c.orientation == "horizontal" for c in chosen) >= 5
+    assert sum(c.orientation == "vertical" for c in chosen) <= 1
+
+    # Active-content geometry must preserve real source aspect ratio even though
+    # analysis uses a square thumbnail internally.
+    geom = Image.new("L", (600, 300), 255)
+    for x in range(80, 520):
+        for y in (90, 210):
+            geom.putpixel((x, y), 0)
+    for y in range(90, 211):
+        for x in (80, 519):
+            geom.putpixel((x, y), 0)
+    # Sparse scan dust at the extreme corners should not expand the active box.
+    geom.putpixel((1, 1), 0)
+    geom.putpixel((598, 298), 0)
+    shape = content_shape_metrics(geom)
+    assert shape["aspect"] > 2.5, f"active aspect lost source geometry: {shape['aspect']:.2f}"
+    assert 0.65 < shape["width_fill"] < 0.90
+    assert 0.30 < shape["height_fill"] < 0.60
+    assert 0.45 < shape["center_x"] < 0.55
+
     # Synthetic line + tone image test; no network required.
     img = Image.new("L", (W, H), 255)
     for x in range(40, 760):
@@ -1182,11 +1245,39 @@ def self_test() -> None:
         for y in range(70, 410):
             if (x + y) % 19 == 0:
                 dark.putpixel((x, y), 35)
-    dummy = Candidate(normalized, 0, "test", image=dark.convert("RGB"), mode="atkinson", content_box=(0, 0, W, H))
+    dummy = Candidate(
+        normalized,
+        0,
+        "test",
+        image=dark.convert("RGB"),
+        mode="atkinson",
+        content_box=(0, 0, W, H),
+        active_box=(80, 70, 720, 410),
+    )
     _, packed_dark, ink = render_candidate(dummy)
     assert len(packed_dark) == FRAME_BYTES
     assert ink < 0.18, f"density control failed: {ink:.3f}"
     assert dummy.preview_content_ink < 0.22, f"content density control failed: {dummy.preview_content_ink:.3f}"
+
+    # Feed/output contract: exact frame size, metadata fields, and cache-busted
+    # gallery preview URLs must stay synchronized.
+    dummy.orientation = "horizontal"
+    dummy.active_aspect = 1.60
+    dummy.active_width_fill = 0.75
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        feed = root / "feed"
+        feed.mkdir()
+        work = write_slot(feed, "2026-09-28", 0, 1, dummy)
+        assert (feed / "slot0.bin").stat().st_size == FRAME_BYTES
+        slot_meta = (feed / "slot0.txt").read_text(encoding="utf-8")
+        assert "orientation=horizontal" in slot_meta
+        assert "ratio=1.60" in slot_meta
+        assert "width_fill=75.0" in slot_meta
+        write_gallery_html(root, "2026-09-28", [work])
+        gallery = (root / "index.html").read_text(encoding="utf-8")
+        assert f"slot0.png?v={work['crc32']}" in gallery
+        assert "75.0% width fill" in gallery
 
     print("Paper Gallery generator self-test passed")
 
