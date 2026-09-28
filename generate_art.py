@@ -127,9 +127,14 @@ class Candidate:
     preview_bw: Image.Image | None = None
     preview_ink: float = 0.0
     preview_content_ink: float = 0.0
-    aspect_ratio: float = 1.0
+    source_aspect: float = 1.0
+    active_aspect: float = 1.0
+    active_width_fill: float = 0.0
+    active_height_fill: float = 0.0
+    active_area_fill: float = 0.0
+    active_center_x: float = 0.5
+    active_center_y: float = 0.5
     orientation: str = "square"
-    active_fraction: float = 0.0
 
     @property
     def id(self) -> str:
@@ -440,6 +445,49 @@ def active_area_fraction(gray: Image.Image) -> float:
     return ((r - l) * (b - t)) / float(small.width * small.height)
 
 
+def content_shape_metrics(gray: Image.Image) -> dict[str, float]:
+    """Estimate the true active-content box inside the artwork sheet/scan."""
+    small = gray.convert("L").resize((320, 320), Image.Resampling.BILINEAR)
+    mask = small.point(lambda p: 255 if p < 238 else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return {
+            "bbox": (0, 0, small.width, small.height),
+            "width_fill": 0.0,
+            "height_fill": 0.0,
+            "area_fill": 0.0,
+            "aspect": 1.0,
+            "center_x": 0.5,
+            "center_y": 0.5,
+        }
+
+    l, t, r, b = bbox
+    bw = max(1, r - l)
+    bh = max(1, b - t)
+    width_fill = bw / float(small.width)
+    height_fill = bh / float(small.height)
+    area_fill = (bw * bh) / float(small.width * small.height)
+    center_x = (l + r) / 2.0 / small.width
+    center_y = (t + b) / 2.0 / small.height
+    return {
+        "bbox": bbox,
+        "width_fill": width_fill,
+        "height_fill": height_fill,
+        "area_fill": area_fill,
+        "aspect": bw / float(bh),
+        "center_x": center_x,
+        "center_y": center_y,
+    }
+
+
+def orientation_from_ratio(ratio: float) -> str:
+    if ratio >= 1.15:
+        return "horizontal"
+    if ratio < 0.90:
+        return "vertical"
+    return "square"
+
+
 def visual_score(metrics: dict[str, float]) -> float:
     """Score how naturally an artwork should survive 1-bit e-paper conversion.
 
@@ -678,9 +726,17 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             image = download_image(session, c)
             cropped = crop_scan_border(ImageOps.grayscale(image))
             metrics = image_metrics(cropped)
+            shape = content_shape_metrics(cropped)
             active_fraction = active_area_fraction(cropped)
-            ratio = cropped.width / cropped.height if cropped.height else 1.0
-            orientation = classify_orientation(ratio)
+
+            c.source_aspect = cropped.width / float(max(1, cropped.height))
+            c.active_aspect = float(shape["aspect"])
+            c.active_width_fill = float(shape["width_fill"])
+            c.active_height_fill = float(shape["height_fill"])
+            c.active_area_fill = float(shape["area_fill"])
+            c.active_center_x = float(shape["center_x"])
+            c.active_center_y = float(shape["center_y"])
+            c.orientation = orientation_from_ratio(c.active_aspect)
 
             title = clean_text(c.raw.get("title"), "Untitled")
 
@@ -693,22 +749,47 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             if metrics["std"] < 18:
                 print(f"{i + 1:02d}/{max_to_try} reject low-contrast {title}")
                 continue
-            if active_fraction < 0.18:
+            if active_fraction < 0.18 or c.active_area_fill < 0.15:
                 print(f"{i + 1:02d}/{max_to_try} reject tiny-content {title}")
                 continue
-            if ratio < 0.62 and visual_score(metrics) < 95:
-                print(f"{i + 1:02d}/{max_to_try} reject narrow-portrait ratio={ratio:.2f} {title}")
+
+            # Reject works whose sheet is landscape-ish but whose actual marks are
+            # essentially a small vertical block floating in empty space.
+            if c.source_aspect >= 1.12 and c.active_aspect < 0.95 and c.active_width_fill < 0.54:
+                print(f"{i + 1:02d}/{max_to_try} reject faux-horiz   {title}")
                 continue
 
             canvas, box = contain_on_canvas_with_box(cropped)
             c.content_box = box
             c.visual_score = visual_score(metrics)
             c.mode = choose_mode(metrics, metadata_blob(c.raw))
-            c.aspect_ratio = ratio
-            c.orientation = orientation
-            c.active_fraction = active_fraction
-            c.score += c.visual_score + aspect_score(ratio)
+            c.score += c.visual_score
             c.image = canvas.convert("RGB")
+
+            # Aspect/orientation preference based on the actual active content.
+            ar = c.active_aspect
+            if 1.35 <= ar <= 2.40:
+                c.score += 32
+            elif 1.15 <= ar < 1.35 or 2.40 < ar <= 2.90:
+                c.score += 22
+            elif 0.90 <= ar < 1.15:
+                c.score += 6
+            elif 0.72 <= ar < 0.90:
+                c.score -= 14
+            else:
+                c.score -= 34
+
+            # Prefer content that actually spreads across the horizontal frame.
+            c.score += max(0.0, c.active_width_fill - 0.58) * 70
+            if c.active_width_fill < 0.50:
+                c.score -= (0.50 - c.active_width_fill) * 95
+            if c.active_area_fill < 0.22:
+                c.score -= (0.22 - c.active_area_fill) * 120
+
+            # Penalize large blank space concentrated on one side.
+            center_offset = abs(c.active_center_x - 0.5)
+            if center_offset > 0.14:
+                c.score -= (center_offset - 0.14) * 95
 
             bw, _, ink = render_candidate(c)
             content_ink = c.preview_content_ink
@@ -736,14 +817,12 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             c.score -= abs(ink - ideal_global) * 340
             c.score -= abs(content_ink - ideal_content) * 240
             c.score += min(active_fraction, 0.65) * 18
-            if active_fraction < 0.28:
-                c.score -= 18
 
             evaluated.append(c)
             print(
-                f"{i + 1:02d}/{max_to_try} score={c.score:6.1f} mode={c.mode:8s} "
-                f"ink={ink*100:4.1f}% content={content_ink*100:4.1f}% "
-                f"active={active_fraction*100:4.1f}% ratio={ratio:.2f} {orientation:10s} {title}"
+                f"{i + 1:02d}/{max_to_try} score={c.score:6.1f} mode={c.mode:8s} orient={c.orientation:10s} "
+                f"ar={c.active_aspect:0.2f} fill={c.active_width_fill*100:4.1f}% ink={ink*100:4.1f}% "
+                f"content={content_ink*100:4.1f}% {title}"
             )
         except Exception as exc:
             print(f"image failed for {c.id}: {exc}")
@@ -755,83 +834,53 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
 
     evaluated.sort(key=lambda c: c.score, reverse=True)
 
-    # Compose a pack for the physical horizontal frame, not merely the gallery page.
-    # For an 8-work pack we target 6 landscape works (75%), allow square-ish works
-    # for variety, and cap true portrait works at one.
-    target_horizontal = max(1, math.ceil(count * 0.75))
-    min_horizontal = max(1, math.ceil(count * 0.625))
-    max_vertical = 1 if count >= 4 else 0
-
-    selected: list[Candidate] = []
-    artists: set[str] = set()
-
-    def artist_key(c: Candidate) -> str:
-        return clean_text(c.raw.get("artist_title") or c.raw.get("artist_display"), "Unknown artist").casefold()
-
-    def add_candidate(c: Candidate, enforce_artist_diversity: bool = True) -> bool:
-        if c in selected:
-            return False
-        key = artist_key(c)
-        if enforce_artist_diversity and key in artists:
-            return False
-        selected.append(c)
-        artists.add(key)
-        return True
-
+    # Build a pack that strongly favors horizontal active content.
     horizontals = [c for c in evaluated if c.orientation == "horizontal"]
     squares = [c for c in evaluated if c.orientation == "square"]
     verticals = [c for c in evaluated if c.orientation == "vertical"]
 
-    # First reserve the majority of the pack for works that naturally fit 800x480.
-    for c in horizontals:
-        if len([x for x in selected if x.orientation == "horizontal"]) >= target_horizontal:
-            break
-        add_candidate(c, enforce_artist_diversity=True)
+    min_horizontal = max(1, min(count, math.ceil(count * 0.625)))
+    target_horizontal = max(min_horizontal, min(count, round(count * 0.75)))
+    max_vertical = 1 if count >= 6 else 0
 
-    # If artist diversity prevented the landscape target, relax only that constraint.
-    for c in horizontals:
-        if len([x for x in selected if x.orientation == "horizontal"]) >= target_horizontal:
-            break
-        add_candidate(c, enforce_artist_diversity=False)
+    selected: list[Candidate] = []
+    selected_ids: set[str] = set()
+    artist_keys: set[str] = set()
 
-    # Fill remaining slots primarily with square-ish works.
-    for c in squares:
-        if len(selected) >= count:
-            break
-        add_candidate(c, enforce_artist_diversity=True)
-    for c in squares:
-        if len(selected) >= count:
-            break
-        add_candidate(c, enforce_artist_diversity=False)
-
-    # Permit at most one portrait as a special piece, and only after horizontal/square.
-    vertical_added = 0
-    for c in verticals:
-        if len(selected) >= count or vertical_added >= max_vertical:
-            break
-        if add_candidate(c, enforce_artist_diversity=True):
-            vertical_added += 1
-    for c in verticals:
-        if len(selected) >= count or vertical_added >= max_vertical:
-            break
-        if add_candidate(c, enforce_artist_diversity=False):
-            vertical_added += 1
-
-    # If strict composition still left slots empty, use the best remaining works,
-    # but keep at least the minimum horizontal share whenever the pool supports it.
-    for c in evaluated:
-        if len(selected) >= count:
-            break
-        current_h = sum(x.orientation == "horizontal" for x in selected)
-        remaining_slots = count - len(selected)
-        if current_h < min_horizontal and remaining_slots <= (min_horizontal - current_h):
-            if c.orientation != "horizontal":
+    def try_add(pool: list[Candidate], limit: int | None = None) -> None:
+        added = 0
+        for cand in pool:
+            if cand.id in selected_ids:
                 continue
-        if c.orientation == "vertical" and sum(x.orientation == "vertical" for x in selected) >= max_vertical:
-            continue
-        add_candidate(c, enforce_artist_diversity=False)
+            artist = clean_text(cand.raw.get("artist_title") or cand.raw.get("artist_display"), "Unknown artist")
+            key = artist.casefold()
+            # Preserve artist diversity while the pack is still being assembled.
+            if key in artist_keys and len(selected) < max(4, count // 2):
+                continue
+            selected.append(cand)
+            selected_ids.add(cand.id)
+            artist_keys.add(key)
+            added += 1
+            if limit is not None and added >= limit:
+                break
+            if len(selected) >= count:
+                break
 
-    selected.sort(key=lambda c: c.score, reverse=True)
+    try_add(horizontals, target_horizontal)
+    if len([c for c in selected if c.orientation == "horizontal"]) < min_horizontal:
+        # If we still somehow missed the minimum, keep pulling horizontals.
+        try_add(horizontals, min_horizontal - len([c for c in selected if c.orientation == "horizontal"]))
+
+    remaining = count - len(selected)
+    if remaining > 0:
+        try_add(squares, remaining)
+    remaining = count - len(selected)
+    if remaining > 0 and max_vertical > 0:
+        try_add(verticals, min(max_vertical, remaining))
+    remaining = count - len(selected)
+    if remaining > 0:
+        try_add(horizontals + squares + verticals, remaining)
+
     return selected[:count]
 
 
