@@ -114,6 +114,10 @@ class Candidate:
     image: Image.Image | None = None
     visual_score: float = 0.0
     mode: str = "atkinson"
+    content_box: tuple[int, int, int, int] | None = None
+    preview_bw: Image.Image | None = None
+    preview_ink: float = 0.0
+    preview_content_ink: float = 0.0
 
     @property
     def id(self) -> str:
@@ -375,8 +379,8 @@ def crop_scan_border(gray: Image.Image) -> Image.Image:
     return cropped
 
 
-def contain_on_canvas(gray: Image.Image) -> Image.Image:
-    """Fit the complete artwork on an 800x480 white canvas with a small margin."""
+def contain_on_canvas_with_box(gray: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Fit the complete artwork on an 800x480 white canvas and return its fitted box."""
     im = gray.convert("L")
     if im.width <= 0 or im.height <= 0:
         raise ValueError("Artwork image has invalid dimensions")
@@ -390,6 +394,11 @@ def contain_on_canvas(gray: Image.Image) -> Image.Image:
     x = (W - im.width) // 2
     y = (H - im.height) // 2
     canvas.paste(im, (x, y))
+    return canvas, (x, y, x + im.width, y + im.height)
+
+
+def contain_on_canvas(gray: Image.Image) -> Image.Image:
+    canvas, _ = contain_on_canvas_with_box(gray)
     return canvas
 
 
@@ -527,6 +536,18 @@ def black_fraction(img1: Image.Image) -> float:
     total = img1.width * img1.height
     return black / total if total else 0.0
 
+
+def black_fraction_in_box(img1: Image.Image, box: tuple[int, int, int, int] | None) -> float:
+    """Black coverage inside the fitted artwork area, excluding white frame margins."""
+    if box is None:
+        return black_fraction(img1)
+    l, t, r, b = box
+    l, t = max(0, l), max(0, t)
+    r, b = min(img1.width, r), min(img1.height, b)
+    if r <= l or b <= t:
+        return black_fraction(img1)
+    return black_fraction(img1.crop((l, t, r, b)))
+
 def pack_1bpp(img1: Image.Image) -> bytes:
     """Pack an 800x480 1-bit frame row-major, MSB-first.
 
@@ -551,41 +572,78 @@ def pack_1bpp(img1: Image.Image) -> bytes:
 
 
 def evaluate_candidates(session: requests.Session, candidates: list[Candidate], count: int) -> list[Candidate]:
-    """Download/evaluate enough candidates to reliably fill the requested pack."""
-    # Start with strong metadata candidates, but continue deeper if some image
-    # downloads fail. Cap work so a transient upstream issue cannot run forever.
-    max_to_try = min(len(candidates), max(count * 6, 36))
+    """Download, render and rank candidates for a light, paper-like e-paper result.
+
+    Visual analysis is performed on the trimmed artwork itself, not on the final
+    800x480 canvas. This prevents large white margins around portrait works from
+    making an intrinsically dark print look deceptively suitable.
+    """
+    max_to_try = min(len(candidates), max(count * 10, 60))
     evaluated: list[Candidate] = []
 
     for i, c in enumerate(candidates[:max_to_try]):
         try:
             image = download_image(session, c)
-            gray = crop_scan_border(ImageOps.grayscale(image))
-            canvas = contain_on_canvas(gray)
-            metrics = image_metrics(canvas)
+            cropped = crop_scan_border(ImageOps.grayscale(image))
+            metrics = image_metrics(cropped)
+
+            # Hard reject source scans that are fundamentally dark/heavy. They can
+            # technically be dithered, but on 1-bit e-paper they read as black slabs
+            # rather than drawings on paper.
+            if metrics["mean"] < 132 or metrics["dark"] > 0.34:
+                print(f"{i + 1:02d}/{max_to_try} reject source-dark  {clean_text(c.raw.get('title'), 'Untitled')}")
+                continue
+            if metrics["white"] < 0.10 and metrics["mean"] < 158:
+                print(f"{i + 1:02d}/{max_to_try} reject low-paper    {clean_text(c.raw.get('title'), 'Untitled')}")
+                continue
+
+            canvas, box = contain_on_canvas_with_box(cropped)
+            c.content_box = box
             c.visual_score = visual_score(metrics)
             c.mode = choose_mode(metrics, metadata_blob(c.raw))
             c.score += c.visual_score
             c.image = canvas.convert("RGB")
+
+            # Render now so ranking sees the actual 1-bit result, not merely the
+            # grayscale source. This is where dense portraits/woodcuts are filtered.
+            bw, _, ink = render_candidate(c)
+            content_ink = c.preview_content_ink
+
+            hard_global = 0.13 if c.mode == "line" else 0.15
+            hard_content = 0.24 if c.mode == "line" else 0.26
+            if ink > hard_global or content_ink > hard_content:
+                print(
+                    f"{i + 1:02d}/{max_to_try} reject dense       "
+                    f"global={ink*100:4.1f}% content={content_ink*100:4.1f}% "
+                    f"{clean_text(c.raw.get('title'), 'Untitled')}"
+                )
+                continue
+
+            # Strongly prefer airy results. Global density matters for the physical
+            # screen; content density prevents portrait margins from gaming it.
+            ideal_global = 0.075 if c.mode == "line" else 0.095
+            ideal_content = 0.15 if c.mode == "line" else 0.18
+            c.score -= max(0.0, ink - ideal_global) * 900
+            c.score -= max(0.0, content_ink - ideal_content) * 650
+            if content_ink < 0.025:
+                c.score -= 18
+
             evaluated.append(c)
             print(
-                f"{i + 1:02d}/{max_to_try} score={c.score:6.1f} "
-                f"mode={c.mode:8s} {clean_text(c.raw.get('title'), 'Untitled')}"
+                f"{i + 1:02d}/{max_to_try} score={c.score:6.1f} mode={c.mode:8s} "
+                f"ink={ink*100:4.1f}% content={content_ink*100:4.1f}% "
+                f"{clean_text(c.raw.get('title'), 'Untitled')}"
             )
         except Exception as exc:
             print(f"image failed for {c.id}: {exc}")
 
-        # Be courteous to the museum CDN without making Actions unnecessarily slow.
-        time.sleep(0.35)
+        time.sleep(0.30)
 
-        # Once we have a healthy surplus of viable images, further downloads add
-        # little value. Keep at least 2x the requested count for final ranking.
-        if len(evaluated) >= max(count * 2, count + 6) and i + 1 >= max(count * 3, 24):
+        if len(evaluated) >= max(count * 3, count + 12) and i + 1 >= max(count * 5, 40):
             break
 
     evaluated.sort(key=lambda c: c.score, reverse=True)
 
-    # Diversify artists where possible.
     selected: list[Candidate] = []
     artists: set[str] = set()
     for c in evaluated:
@@ -598,7 +656,6 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
         if len(selected) == count:
             return selected
 
-    # Fill any remaining slots even if that requires repeated artists.
     for c in evaluated:
         if c not in selected:
             selected.append(c)
@@ -608,47 +665,56 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
 
 
 def render_candidate(c: Candidate) -> tuple[Image.Image, bytes, float]:
-    """Render with automatic ink-density control.
+    """Render with density control measured both globally and within the artwork.
 
-    1-bit e-paper looks substantially darker than a grayscale monitor preview.
-    We therefore render progressively lighter variants until black coverage is
-    in a comfortable range. This is deterministic and requires no ESP32 work.
+    Global density alone is misleading for portrait works because white margins
+    dilute the percentage. We therefore keep lightening until both the whole
+    frame and the fitted artwork area are comfortably paper-like.
     """
     if c.image is None:
         raise RuntimeError(f"candidate {c.id} has no prepared image")
     gray = ImageOps.grayscale(c.image)
 
     if c.mode == "line":
-        target = 0.115
+        target_global, target_content = 0.090, 0.175
         profiles = [
-            (0.74, 8, 48),
-            (0.66, 10, 54),
-            (0.58, 14, 60),
-            (0.52, 18, 66),
+            (0.70, 10, 52),
+            (0.62, 14, 58),
+            (0.55, 18, 64),
+            (0.49, 22, 70),
+            (0.44, 26, 76),
         ]
         rendered = [line_art(gray, gamma=g, offset=o, local_gap=gap) for g, o, gap in profiles]
     else:
-        target = 0.165
+        target_global, target_content = 0.115, 0.195
         profiles = [
-            (0.80, 6, 116.0),
-            (0.72, 9, 112.0),
-            (0.64, 12, 108.0),
-            (0.56, 16, 104.0),
+            (0.76, 8, 114.0),
+            (0.68, 12, 108.0),
+            (0.60, 16, 102.0),
+            (0.53, 20, 96.0),
+            (0.47, 24, 90.0),
         ]
         rendered = [atkinson(gray, gamma=g, offset=o, threshold=t) for g, o, t in profiles]
 
     bw = rendered[-1]
     ink = black_fraction(bw)
+    content_ink = black_fraction_in_box(bw, c.content_box)
     for attempt in rendered:
         attempt_ink = black_fraction(attempt)
-        bw, ink = attempt, attempt_ink
-        if attempt_ink <= target:
+        attempt_content = black_fraction_in_box(attempt, c.content_box)
+        bw, ink, content_ink = attempt, attempt_ink, attempt_content
+        if attempt_ink <= target_global and attempt_content <= target_content:
             break
+
+    c.preview_bw = bw
+    c.preview_ink = ink
+    c.preview_content_ink = content_ink
 
     packed = pack_1bpp(bw)
     if len(packed) != FRAME_BYTES:
         raise RuntimeError(f"packed frame is {len(packed)} bytes, expected {FRAME_BYTES}")
     return bw, packed, ink
+
 
 def source_url(a: dict[str, Any]) -> str:
     src = clean_text(a.get("source_url"))
@@ -685,6 +751,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         f"source={src}",
         f"mode={c.mode}",
         f"ink={ink * 100:.1f}",
+        f"content_ink={c.preview_content_ink * 100:.1f}",
         f"bytes={len(packed)}",
         f"crc32={crc:08X}",
     ]
@@ -700,6 +767,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         "source": src,
         "mode": c.mode,
         "ink": round(ink * 100, 1),
+        "content_ink": round(c.preview_content_ink * 100, 1),
         "bytes": len(packed),
         "crc32": f"{crc:08X}",
     }
@@ -713,12 +781,13 @@ def write_gallery_html(site_dir: Path, pack: str, works: list[dict[str, Any]]) -
         date = html.escape(str(work["date"]), quote=True)
         mode = html.escape(str(work["mode"]), quote=True)
         ink = html.escape(str(work.get("ink", "?")), quote=True)
+        content_ink = html.escape(str(work.get("content_ink", "?")), quote=True)
         source = html.escape(str(work["source"]), quote=True)
         slot = int(work["slot"])
         cards.append(
             f'<article><img src="feed/slot{slot}.png" alt="{title}">'
             f"<h2>{title}</h2><p>{artist}</p>"
-            f'<p class="muted">{date} · {mode} · {ink}% ink</p>'
+            f'<p class="muted">{date} · {mode} · {ink}% frame ink · {content_ink}% artwork ink</p>'
             f'<a href="{source}" rel="noopener">Museum record</a></article>'
         )
 
@@ -849,10 +918,11 @@ def self_test() -> None:
         for y in range(70, 410):
             if (x + y) % 19 == 0:
                 dark.putpixel((x, y), 35)
-    dummy = Candidate(normalized, 0, "test", image=dark.convert("RGB"), mode="atkinson")
+    dummy = Candidate(normalized, 0, "test", image=dark.convert("RGB"), mode="atkinson", content_box=(0, 0, W, H))
     _, packed_dark, ink = render_candidate(dummy)
     assert len(packed_dark) == FRAME_BYTES
-    assert ink < 0.30, f"density control failed: {ink:.3f}"
+    assert ink < 0.18, f"density control failed: {ink:.3f}"
+    assert dummy.preview_content_ink < 0.22, f"content density control failed: {dummy.preview_content_ink:.3f}"
 
     print("Paper Gallery generator self-test passed")
 
