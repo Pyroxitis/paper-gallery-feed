@@ -245,7 +245,7 @@ def make_session() -> requests.Session:
     session.mount("http://", adapter)
     session.headers.update(
         {
-            "User-Agent": "PaperGallery/1.2 (+personal e-paper art frame)",
+            "User-Agent": "PaperGallery/1.3 (+personal e-paper art frame)",
             "Accept": "*/*",
         }
     )
@@ -409,20 +409,26 @@ def image_metrics(gray: Image.Image) -> dict[str, float]:
 
 
 def visual_score(metrics: dict[str, float]) -> float:
-    # Good 1-bit e-paper candidates generally have a light substrate, useful
-    # edge structure, and limited solid-black coverage.
-    score = 0.0
-    score += min(metrics["white"], 0.75) * 80
-    score += min(metrics["edge"] / 30.0, 1.5) * 45
-    score += min(metrics["std"] / 65.0, 1.5) * 35
-    if metrics["dark"] > 0.34:
-        score -= (metrics["dark"] - 0.34) * 220
-    if metrics["mean"] < 115:
-        score -= (115 - metrics["mean"]) * 1.2
-    if metrics["white"] < 0.12:
-        score -= 35
-    return score
+    """Score how naturally an artwork should survive 1-bit e-paper conversion.
 
+    Paper Gallery deliberately prefers light paper, visible line structure and
+    modest ink coverage. Dense midtones that look fine on a monitor tend to
+    become large black masses after 1-bit dithering, so they are penalized.
+    """
+    score = 0.0
+    score += min(metrics["white"], 0.85) * 105
+    score += min(metrics["edge"] / 30.0, 1.5) * 45
+    score += min(metrics["std"] / 65.0, 1.4) * 28
+
+    if metrics["dark"] > 0.18:
+        score -= (metrics["dark"] - 0.18) * 360
+    if metrics["mean"] < 165:
+        score -= (165 - metrics["mean"]) * 1.5
+    if metrics["mid"] > 0.52:
+        score -= (metrics["mid"] - 0.52) * 120
+    if metrics["white"] < 0.24:
+        score -= 55
+    return score
 
 def choose_mode(metrics: dict[str, float], blob: str) -> str:
     line_keywords = (
@@ -442,40 +448,66 @@ def choose_mode(metrics: dict[str, float], blob: str) -> str:
 
 
 def auto_levels(gray: Image.Image) -> Image.Image:
-    # Conservative autocontrast avoids erasing pale hatch marks.
-    return ImageOps.autocontrast(gray.convert("L"), cutoff=(0.7, 0.7))
+    # Very gentle normalization. Heavy autocontrast makes aged paper and pale
+    # wash turn into dark texture on a 1-bit screen.
+    return ImageOps.autocontrast(gray.convert("L"), cutoff=(0.35, 0.35))
 
 
-def line_art(gray: Image.Image) -> Image.Image:
-    g = auto_levels(gray)
-    g = ImageEnhance.Contrast(g).enhance(1.18)
-    g = g.filter(ImageFilter.UnsharpMask(radius=0.8, percent=110, threshold=3))
+def lift_midtones(gray: Image.Image, gamma: float = 0.76, offset: int = 6) -> Image.Image:
+    """Brighten paper/midtones while leaving genuinely dark ink recognizable."""
+    if gamma <= 0:
+        raise ValueError("gamma must be positive")
+    lut = []
+    for i in range(256):
+        v = 255.0 * ((i / 255.0) ** gamma) + offset
+        lut.append(max(0, min(255, round(v))))
+    return gray.convert("L").point(lut)
 
-    # Slightly adaptive threshold using a blurred local background estimate.
+
+def line_art(
+    gray: Image.Image,
+    *,
+    gamma: float = 0.72,
+    offset: int = 8,
+    local_gap: int = 48,
+) -> Image.Image:
+    """Render clean drawings with intentionally restrained black coverage."""
+    g = lift_midtones(auto_levels(gray), gamma=gamma, offset=offset)
+    g = g.filter(ImageFilter.UnsharpMask(radius=0.8, percent=105, threshold=4))
+
+    # Compare each pixel with its local paper/background estimate. The older
+    # bg-18 threshold was too aggressive and turned pale shading into black.
     local = g.filter(ImageFilter.GaussianBlur(radius=5.0))
     a = g.tobytes()
     b = local.tobytes()
     out = bytearray(len(a))
     for i, (p, bg) in enumerate(zip(a, b)):
-        threshold = max(128, min(224, bg - 18))
+        threshold = max(105, min(198, bg - local_gap))
         out[i] = 255 if p >= threshold else 0
     return Image.frombytes("L", g.size, bytes(out)).convert("1", dither=Image.Dither.NONE)
 
 
-def atkinson(gray: Image.Image) -> Image.Image:
-    g = auto_levels(gray)
-    g = ImageEnhance.Contrast(g).enhance(1.08)
+def atkinson(
+    gray: Image.Image,
+    *,
+    gamma: float = 0.78,
+    offset: int = 6,
+    threshold: float = 116.0,
+) -> Image.Image:
+    """Light-biased Atkinson dithering for engravings and tonal prints."""
+    g = lift_midtones(auto_levels(gray), gamma=gamma, offset=offset)
     w, h = g.size
     px = [float(v) for v in g.tobytes()]
 
-    # Atkinson dithering: distribute 1/8 of the quantization error to six
-    # nearby pixels, preserving crisp highlights well on monochrome e-paper.
+    # A threshold below 128 intentionally biases the result toward white. On
+    # monochrome e-paper this preserves the look of paper instead of allowing
+    # gray engraving tone to collapse into large black regions.
     for y in range(h):
         row = y * w
         for x in range(w):
             i = row + x
             old = px[i]
-            new = 255.0 if old >= 128.0 else 0.0
+            new = 255.0 if old >= threshold else 0.0
             px[i] = new
             error = (old - new) / 8.0
             for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
@@ -484,9 +516,16 @@ def atkinson(gray: Image.Image) -> Image.Image:
                     j = ny * w + nx
                     px[j] = min(255.0, max(0.0, px[j] + error))
 
-    data = bytes(255 if v >= 128 else 0 for v in px)
+    data = bytes(255 if v >= threshold else 0 for v in px)
     return Image.frombytes("L", (w, h), data).convert("1", dither=Image.Dither.NONE)
 
+
+def black_fraction(img1: Image.Image) -> float:
+    """Fraction of the final frame that is black ink (0.0 to 1.0)."""
+    hist = img1.convert("1").histogram()
+    black = hist[0] if hist else 0
+    total = img1.width * img1.height
+    return black / total if total else 0.0
 
 def pack_1bpp(img1: Image.Image) -> bytes:
     """Pack an 800x480 1-bit frame row-major, MSB-first.
@@ -568,16 +607,48 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
     return selected
 
 
-def render_candidate(c: Candidate) -> tuple[Image.Image, bytes]:
+def render_candidate(c: Candidate) -> tuple[Image.Image, bytes, float]:
+    """Render with automatic ink-density control.
+
+    1-bit e-paper looks substantially darker than a grayscale monitor preview.
+    We therefore render progressively lighter variants until black coverage is
+    in a comfortable range. This is deterministic and requires no ESP32 work.
+    """
     if c.image is None:
         raise RuntimeError(f"candidate {c.id} has no prepared image")
     gray = ImageOps.grayscale(c.image)
-    bw = line_art(gray) if c.mode == "line" else atkinson(gray)
+
+    if c.mode == "line":
+        target = 0.115
+        profiles = [
+            (0.74, 8, 48),
+            (0.66, 10, 54),
+            (0.58, 14, 60),
+            (0.52, 18, 66),
+        ]
+        rendered = [line_art(gray, gamma=g, offset=o, local_gap=gap) for g, o, gap in profiles]
+    else:
+        target = 0.165
+        profiles = [
+            (0.80, 6, 116.0),
+            (0.72, 9, 112.0),
+            (0.64, 12, 108.0),
+            (0.56, 16, 104.0),
+        ]
+        rendered = [atkinson(gray, gamma=g, offset=o, threshold=t) for g, o, t in profiles]
+
+    bw = rendered[-1]
+    ink = black_fraction(bw)
+    for attempt in rendered:
+        attempt_ink = black_fraction(attempt)
+        bw, ink = attempt, attempt_ink
+        if attempt_ink <= target:
+            break
+
     packed = pack_1bpp(bw)
     if len(packed) != FRAME_BYTES:
         raise RuntimeError(f"packed frame is {len(packed)} bytes, expected {FRAME_BYTES}")
-    return bw, packed
-
+    return bw, packed, ink
 
 def source_url(a: dict[str, Any]) -> str:
     src = clean_text(a.get("source_url"))
@@ -590,7 +661,7 @@ def source_url(a: dict[str, Any]) -> str:
 
 
 def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dict[str, Any]:
-    bw, packed = render_candidate(c)
+    bw, packed, ink = render_candidate(c)
     crc = binascii.crc32(packed) & 0xFFFFFFFF
     a = c.raw
     title = clean_text(a.get("title"), "Untitled")
@@ -613,6 +684,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         f"museum={MUSEUM}",
         f"source={src}",
         f"mode={c.mode}",
+        f"ink={ink * 100:.1f}",
         f"bytes={len(packed)}",
         f"crc32={crc:08X}",
     ]
@@ -627,6 +699,7 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         "museum": MUSEUM,
         "source": src,
         "mode": c.mode,
+        "ink": round(ink * 100, 1),
         "bytes": len(packed),
         "crc32": f"{crc:08X}",
     }
@@ -639,12 +712,13 @@ def write_gallery_html(site_dir: Path, pack: str, works: list[dict[str, Any]]) -
         artist = html.escape(str(work["artist"]), quote=True)
         date = html.escape(str(work["date"]), quote=True)
         mode = html.escape(str(work["mode"]), quote=True)
+        ink = html.escape(str(work.get("ink", "?")), quote=True)
         source = html.escape(str(work["source"]), quote=True)
         slot = int(work["slot"])
         cards.append(
             f'<article><img src="feed/slot{slot}.png" alt="{title}">'
             f"<h2>{title}</h2><p>{artist}</p>"
-            f'<p class="muted">{date} · {mode}</p>'
+            f'<p class="muted">{date} · {mode} · {ink}% ink</p>'
             f'<a href="{source}" rel="noopener">Museum record</a></article>'
         )
 
@@ -768,6 +842,17 @@ def self_test() -> None:
     test.putpixel((0, 0), 0)
     packed = pack_1bpp(test)
     assert packed[0] == 0x7F, f"unexpected first packed byte: 0x{packed[0]:02X}"
+
+    # Density control sanity check on a deliberately dark tonal test frame.
+    dark = Image.new("L", (W, H), 150)
+    for x in range(80, 720, 8):
+        for y in range(70, 410):
+            if (x + y) % 19 == 0:
+                dark.putpixel((x, y), 35)
+    dummy = Candidate(normalized, 0, "test", image=dark.convert("RGB"), mode="atkinson")
+    _, packed_dark, ink = render_candidate(dummy)
+    assert len(packed_dark) == FRAME_BYTES
+    assert ink < 0.30, f"density control failed: {ink:.3f}"
 
     print("Paper Gallery generator self-test passed")
 
