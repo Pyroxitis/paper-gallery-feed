@@ -57,18 +57,23 @@ API_FIELDS = ",".join(
 )
 
 SEARCH_TERMS = [
+    "architectural drawing",
+    "botanical illustration",
+    "natural history illustration",
+    "scientific illustration",
     "etching",
     "engraving",
     "woodcut",
     "wood engraving",
-    "pen ink drawing",
-    "architectural drawing",
-    "botanical illustration",
-    "landscape drawing",
     "drypoint",
+    "pen and ink drawing",
+    "ink drawing",
+    "graphite drawing",
+    "line engraving landscape",
+    "city view engraving",
+    "architectural print",
+    "landscape drawing",
     "lithograph",
-    "natural history illustration",
-    "city view print",
 ]
 
 POSITIVE = {
@@ -103,6 +108,10 @@ NEGATIVE = {
     "furniture": -160,
     "coin": -150,
     "vessel": -130,
+    "poster": -75,
+    "manuscript": -75,
+    "nude": -18,
+    "mythological": -12,
 }
 
 
@@ -291,9 +300,9 @@ def gather_candidates(session: requests.Session, seed: int) -> list[Candidate]:
 
     # Ten modest search requests gives enough variety while staying gentle on
     # the public API. Search-term order and score jitter are deterministic per day.
-    for q in terms[:10]:
+    for q in terms[:14]:
         try:
-            rows = api_search(session, q, 30)
+            rows = api_search(session, q, 48)
         except (requests.RequestException, ValueError, RuntimeError) as exc:
             print(f"search failed for {q!r}: {exc}")
             continue
@@ -304,7 +313,7 @@ def gather_candidates(session: requests.Session, seed: int) -> list[Candidate]:
                 continue
             seen.add(object_key)
             score = metadata_score(a)
-            if score > 15:
+            if score > 22:
                 # Daily deterministic jitter prevents the same famous works from
                 # dominating every pack while retaining quality preference.
                 score += rng.uniform(-28, 28)
@@ -417,26 +426,39 @@ def image_metrics(gray: Image.Image) -> dict[str, float]:
     return {"mean": mean, "std": std, "white": white, "dark": dark, "mid": mid, "edge": edge_mean}
 
 
+def active_area_fraction(gray: Image.Image) -> float:
+    """How much of the artwork rectangle is actually occupied by visible marks."""
+    small = gray.convert("L").resize((240, 240), Image.Resampling.BILINEAR)
+    mask = small.point(lambda p: 255 if p < 238 else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return 0.0
+    l, t, r, b = bbox
+    return ((r - l) * (b - t)) / float(small.width * small.height)
+
+
 def visual_score(metrics: dict[str, float]) -> float:
     """Score how naturally an artwork should survive 1-bit e-paper conversion.
 
-    Paper Gallery deliberately prefers light paper, visible line structure and
-    modest ink coverage. Dense midtones that look fine on a monitor tend to
-    become large black masses after 1-bit dithering, so they are penalized.
+    Paper Gallery deliberately prefers crisp drawings with visible paper and
+    moderate structure. Very dark, muddy, or very flat/low-contrast images are
+    penalized.
     """
     score = 0.0
-    score += min(metrics["white"], 0.85) * 105
-    score += min(metrics["edge"] / 30.0, 1.5) * 45
-    score += min(metrics["std"] / 65.0, 1.4) * 28
+    score += min(metrics["white"], 0.88) * 110
+    score += min(metrics["edge"] / 28.0, 1.6) * 52
+    score += min(metrics["std"] / 58.0, 1.5) * 40
 
-    if metrics["dark"] > 0.18:
-        score -= (metrics["dark"] - 0.18) * 360
-    if metrics["mean"] < 165:
-        score -= (165 - metrics["mean"]) * 1.5
-    if metrics["mid"] > 0.52:
-        score -= (metrics["mid"] - 0.52) * 120
-    if metrics["white"] < 0.24:
-        score -= 55
+    if metrics["dark"] > 0.17:
+        score -= (metrics["dark"] - 0.17) * 420
+    if metrics["mean"] < 168:
+        score -= (168 - metrics["mean"]) * 1.8
+    if metrics["mid"] > 0.50:
+        score -= (metrics["mid"] - 0.50) * 140
+    if metrics["white"] < 0.22:
+        score -= 60
+    if metrics["std"] < 24:
+        score -= (24 - metrics["std"]) * 1.6
     return score
 
 def choose_mode(metrics: dict[str, float], blob: str) -> str:
@@ -448,18 +470,28 @@ def choose_mode(metrics: dict[str, float], blob: str) -> str:
         "graphite",
         "drawing",
         "woodcut",
+        "wood engraving",
+        "illustration",
+        "scientific",
     )
-    if any(k in blob for k in line_keywords) and metrics["white"] > 0.28:
+    tonal_keywords = ("mezzotint", "aquatint", "tonal", "wash", "charcoal")
+    if any(k in blob for k in line_keywords):
         return "line"
-    if metrics["mid"] < 0.16 and metrics["white"] > 0.38:
+    if any(k in blob for k in tonal_keywords) and metrics["mid"] > 0.28:
+        return "atkinson"
+    if metrics["white"] > 0.26 and metrics["mid"] < 0.34:
         return "line"
-    return "atkinson"
+    if metrics["std"] < 24 and metrics["mid"] > 0.28:
+        return "atkinson"
+    if metrics["dark"] < 0.12 and metrics["edge"] > 11:
+        return "line"
+    return "line"
 
 
 def auto_levels(gray: Image.Image) -> Image.Image:
-    # Very gentle normalization. Heavy autocontrast makes aged paper and pale
-    # wash turn into dark texture on a 1-bit screen.
-    return ImageOps.autocontrast(gray.convert("L"), cutoff=(0.35, 0.35))
+    # Gentle normalization. Heavy autocontrast makes aged paper and pale wash
+    # turn into dark texture on a 1-bit screen.
+    return ImageOps.autocontrast(gray.convert("L"), cutoff=(0.25, 0.25))
 
 
 def lift_midtones(gray: Image.Image, gamma: float = 0.76, offset: int = 6) -> Image.Image:
@@ -473,30 +505,65 @@ def lift_midtones(gray: Image.Image, gamma: float = 0.76, offset: int = 6) -> Im
     return gray.convert("L").point(lut)
 
 
+def boost_contrast(gray: Image.Image, contrast: float = 1.12, sharpen: float = 1.06) -> Image.Image:
+    g = ImageEnhance.Contrast(gray.convert("L")).enhance(contrast)
+    g = g.filter(ImageFilter.UnsharpMask(radius=0.8, percent=int((sharpen - 1.0) * 100 + 95), threshold=3))
+    return g
+
+
 def line_art(
     gray: Image.Image,
     *,
     gamma: float = 0.72,
     offset: int = 8,
     local_gap: int = 48,
+    contrast: float = 1.12,
 ) -> Image.Image:
     """Render clean drawings with intentionally restrained black coverage."""
-    g = lift_midtones(auto_levels(gray), gamma=gamma, offset=offset)
-    g = g.filter(ImageFilter.UnsharpMask(radius=0.8, percent=105, threshold=4))
+    g = boost_contrast(lift_midtones(auto_levels(gray), gamma=gamma, offset=offset), contrast=contrast)
 
-    # Compare each pixel with its local paper/background estimate. The older
-    # bg-18 threshold was too aggressive and turned pale shading into black.
     local = g.filter(ImageFilter.GaussianBlur(radius=5.0))
     a = g.tobytes()
     b = local.tobytes()
     out = bytearray(len(a))
     for i, (p, bg) in enumerate(zip(a, b)):
-        threshold = max(105, min(198, bg - local_gap))
+        threshold = max(112, min(204, bg - local_gap))
         out[i] = 255 if p >= threshold else 0
     return Image.frombytes("L", g.size, bytes(out)).convert("1", dither=Image.Dither.NONE)
 
 
 def atkinson(
+    gray: Image.Image,
+    *,
+    gamma: float = 0.78,
+    offset: int = 6,
+    threshold: float = 116.0,
+    contrast: float = 1.08,
+) -> Image.Image:
+    """Light-biased Atkinson dithering for engravings and tonal prints."""
+    g = boost_contrast(lift_midtones(auto_levels(gray), gamma=gamma, offset=offset), contrast=contrast)
+    w, h = g.size
+    px = [float(v) for v in g.tobytes()]
+
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            i = row + x
+            old = px[i]
+            new = 255.0 if old >= threshold else 0.0
+            px[i] = new
+            error = (old - new) / 8.0
+            for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    j = ny * w + nx
+                    px[j] = min(255.0, max(0.0, px[j] + error))
+
+    data = bytes(255 if v >= threshold else 0 for v in px)
+    return Image.frombytes("L", (w, h), data).convert("1", dither=Image.Dither.NONE)
+
+
+def black_fraction(
     gray: Image.Image,
     *,
     gamma: float = 0.78,
@@ -572,13 +639,8 @@ def pack_1bpp(img1: Image.Image) -> bytes:
 
 
 def evaluate_candidates(session: requests.Session, candidates: list[Candidate], count: int) -> list[Candidate]:
-    """Download, render and rank candidates for a light, paper-like e-paper result.
-
-    Visual analysis is performed on the trimmed artwork itself, not on the final
-    800x480 canvas. This prevents large white margins around portrait works from
-    making an intrinsically dark print look deceptively suitable.
-    """
-    max_to_try = min(len(candidates), max(count * 10, 60))
+    """Download, render and rank candidates for a light, paper-like e-paper result."""
+    max_to_try = min(len(candidates), max(count * 18, 96))
     evaluated: list[Candidate] = []
 
     for i, c in enumerate(candidates[:max_to_try]):
@@ -586,15 +648,21 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             image = download_image(session, c)
             cropped = crop_scan_border(ImageOps.grayscale(image))
             metrics = image_metrics(cropped)
+            active_fraction = active_area_fraction(cropped)
 
-            # Hard reject source scans that are fundamentally dark/heavy. They can
-            # technically be dithered, but on 1-bit e-paper they read as black slabs
-            # rather than drawings on paper.
+            title = clean_text(c.raw.get("title"), "Untitled")
+
             if metrics["mean"] < 132 or metrics["dark"] > 0.34:
-                print(f"{i + 1:02d}/{max_to_try} reject source-dark  {clean_text(c.raw.get('title'), 'Untitled')}")
+                print(f"{i + 1:02d}/{max_to_try} reject source-dark  {title}")
                 continue
             if metrics["white"] < 0.10 and metrics["mean"] < 158:
-                print(f"{i + 1:02d}/{max_to_try} reject low-paper    {clean_text(c.raw.get('title'), 'Untitled')}")
+                print(f"{i + 1:02d}/{max_to_try} reject low-paper    {title}")
+                continue
+            if metrics["std"] < 18:
+                print(f"{i + 1:02d}/{max_to_try} reject low-contrast {title}")
+                continue
+            if active_fraction < 0.18:
+                print(f"{i + 1:02d}/{max_to_try} reject tiny-content {title}")
                 continue
 
             canvas, box = contain_on_canvas_with_box(cropped)
@@ -604,42 +672,46 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             c.score += c.visual_score
             c.image = canvas.convert("RGB")
 
-            # Render now so ranking sees the actual 1-bit result, not merely the
-            # grayscale source. This is where dense portraits/woodcuts are filtered.
             bw, _, ink = render_candidate(c)
             content_ink = c.preview_content_ink
 
-            hard_global = 0.13 if c.mode == "line" else 0.15
-            hard_content = 0.24 if c.mode == "line" else 0.26
+            hard_global = 0.125 if c.mode == "line" else 0.145
+            hard_content = 0.23 if c.mode == "line" else 0.25
+            min_global = 0.055 if c.mode == "line" else 0.060
+            min_content = 0.125 if c.mode == "line" else 0.135
+
             if ink > hard_global or content_ink > hard_content:
                 print(
                     f"{i + 1:02d}/{max_to_try} reject dense       "
-                    f"global={ink*100:4.1f}% content={content_ink*100:4.1f}% "
-                    f"{clean_text(c.raw.get('title'), 'Untitled')}"
+                    f"global={ink*100:4.1f}% content={content_ink*100:4.1f}% {title}"
+                )
+                continue
+            if ink < min_global or content_ink < min_content:
+                print(
+                    f"{i + 1:02d}/{max_to_try} reject faint       "
+                    f"global={ink*100:4.1f}% content={content_ink*100:4.1f}% {title}"
                 )
                 continue
 
-            # Strongly prefer airy results. Global density matters for the physical
-            # screen; content density prevents portrait margins from gaming it.
-            ideal_global = 0.075 if c.mode == "line" else 0.095
-            ideal_content = 0.15 if c.mode == "line" else 0.18
-            c.score -= max(0.0, ink - ideal_global) * 900
-            c.score -= max(0.0, content_ink - ideal_content) * 650
-            if content_ink < 0.025:
+            ideal_global = 0.078 if c.mode == "line" else 0.090
+            ideal_content = 0.158 if c.mode == "line" else 0.170
+            c.score -= abs(ink - ideal_global) * 340
+            c.score -= abs(content_ink - ideal_content) * 240
+            c.score += min(active_fraction, 0.65) * 18
+            if active_fraction < 0.28:
                 c.score -= 18
 
             evaluated.append(c)
             print(
                 f"{i + 1:02d}/{max_to_try} score={c.score:6.1f} mode={c.mode:8s} "
-                f"ink={ink*100:4.1f}% content={content_ink*100:4.1f}% "
-                f"{clean_text(c.raw.get('title'), 'Untitled')}"
+                f"ink={ink*100:4.1f}% content={content_ink*100:4.1f}% active={active_fraction*100:4.1f}% {title}"
             )
         except Exception as exc:
             print(f"image failed for {c.id}: {exc}")
 
-        time.sleep(0.30)
+        time.sleep(0.20)
 
-        if len(evaluated) >= max(count * 3, count + 12) and i + 1 >= max(count * 5, 40):
+        if len(evaluated) >= max(count * 4, count + 16) and i + 1 >= max(count * 6, 48):
             break
 
     evaluated.sort(key=lambda c: c.score, reverse=True)
@@ -649,7 +721,7 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
     for c in evaluated:
         artist = clean_text(c.raw.get("artist_title") or c.raw.get("artist_display"), "Unknown artist")
         key = artist.casefold()
-        if key in artists and len(selected) < max(3, count // 2):
+        if key in artists and len(selected) < max(4, count // 2):
             continue
         selected.append(c)
         artists.add(key)
@@ -665,47 +737,58 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
 
 
 def render_candidate(c: Candidate) -> tuple[Image.Image, bytes, float]:
-    """Render with density control measured both globally and within the artwork.
-
-    Global density alone is misleading for portrait works because white margins
-    dilute the percentage. We therefore keep lightening until both the whole
-    frame and the fitted artwork area are comfortably paper-like.
-    """
+    """Render with density control measured both globally and within the artwork."""
     if c.image is None:
         raise RuntimeError(f"candidate {c.id} has no prepared image")
     gray = ImageOps.grayscale(c.image)
 
     if c.mode == "line":
-        target_global, target_content = 0.090, 0.175
+        global_min, global_max, global_center = 0.060, 0.095, 0.078
+        content_min, content_max, content_center = 0.135, 0.180, 0.158
         profiles = [
-            (0.70, 10, 52),
-            (0.62, 14, 58),
-            (0.55, 18, 64),
-            (0.49, 22, 70),
-            (0.44, 26, 76),
+            (0.82, 4, 40, 1.16),
+            (0.76, 6, 46, 1.14),
+            (0.70, 10, 52, 1.12),
+            (0.64, 14, 58, 1.10),
+            (0.58, 18, 64, 1.08),
         ]
-        rendered = [line_art(gray, gamma=g, offset=o, local_gap=gap) for g, o, gap in profiles]
+        rendered = [line_art(gray, gamma=g, offset=o, local_gap=gap, contrast=ct) for g, o, gap, ct in profiles]
     else:
-        target_global, target_content = 0.115, 0.195
+        global_min, global_max, global_center = 0.065, 0.115, 0.090
+        content_min, content_max, content_center = 0.140, 0.195, 0.170
         profiles = [
-            (0.76, 8, 114.0),
-            (0.68, 12, 108.0),
-            (0.60, 16, 102.0),
-            (0.53, 20, 96.0),
-            (0.47, 24, 90.0),
+            (0.84, 4, 122.0, 1.10),
+            (0.80, 6, 118.0, 1.09),
+            (0.76, 8, 114.0, 1.08),
+            (0.70, 12, 108.0, 1.07),
+            (0.64, 16, 102.0, 1.06),
         ]
-        rendered = [atkinson(gray, gamma=g, offset=o, threshold=t) for g, o, t in profiles]
+        rendered = [atkinson(gray, gamma=g, offset=o, threshold=t, contrast=ct) for g, o, t, ct in profiles]
 
-    bw = rendered[-1]
-    ink = black_fraction(bw)
-    content_ink = black_fraction_in_box(bw, c.content_box)
+    best = None
+    best_score = float('inf')
     for attempt in rendered:
         attempt_ink = black_fraction(attempt)
         attempt_content = black_fraction_in_box(attempt, c.content_box)
-        bw, ink, content_ink = attempt, attempt_ink, attempt_content
-        if attempt_ink <= target_global and attempt_content <= target_content:
-            break
+        penalty = 0.0
+        # Strong penalties outside the acceptable bands.
+        if attempt_ink < global_min:
+            penalty += (global_min - attempt_ink) * 2600
+        if attempt_ink > global_max:
+            penalty += (attempt_ink - global_max) * 2600
+        if attempt_content < content_min:
+            penalty += (content_min - attempt_content) * 2100
+        if attempt_content > content_max:
+            penalty += (attempt_content - content_max) * 2100
+        # Softer preference for the center of the band.
+        penalty += abs(attempt_ink - global_center) * 260
+        penalty += abs(attempt_content - content_center) * 190
+        if penalty < best_score:
+            best_score = penalty
+            best = (attempt, attempt_ink, attempt_content)
 
+    assert best is not None
+    bw, ink, content_ink = best
     c.preview_bw = bw
     c.preview_ink = ink
     c.preview_content_ink = content_ink
