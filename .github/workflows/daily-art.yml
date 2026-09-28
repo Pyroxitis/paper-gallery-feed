@@ -1,4 +1,4 @@
-name: Build Paper Gallery daily art pack
+name: Build Paper Gallery daily feeds
 
 on:
   workflow_dispatch:
@@ -34,8 +34,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate today's artwork
+      - name: Self-test generators
+        run: |
+          python generate_art.py --self-test
+          python generate_aerospace.py --self-test
+
+      - name: Generate Classic Art feed
         run: python generate_art.py --output site/feed --site site --count 8
+
+      - name: Generate Aerospace Drawings feed
+        run: python generate_aerospace.py --output site/feed/aerospace --site site/aerospace --count-per-category 4
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
