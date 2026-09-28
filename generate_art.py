@@ -230,6 +230,56 @@ def metadata_blob(a: dict[str, Any]) -> str:
     return clean_text(parts).lower()
 
 
+def curation_penalty(a: dict[str, Any]) -> float:
+    """Penalize records that are usually awkward as a single framed artwork.
+
+    These are not hard exclusions: an exceptional work may still rank highly,
+    but compound recto/verso records, sketch sheets, and study sheets must clear
+    a substantially higher visual-quality bar.
+    """
+    title = clean_text(a.get("title")).lower()
+    blob = metadata_blob(a)
+    penalty = 0.0
+
+    has_recto = "recto" in title
+    has_verso = "verso" in title
+    if has_recto and has_verso:
+        penalty -= 90
+    elif has_recto or has_verso:
+        penalty -= 32
+
+    compound_terms = {
+        "sheet of sketches": -55,
+        "sheet of studies": -55,
+        "multiple studies": -45,
+        "various sketches": -45,
+        "sketches": -22,
+        "studies": -18,
+        "study sheet": -42,
+        "double-sided": -55,
+        "two scenes": -28,
+        "three scenes": -34,
+        "four scenes": -38,
+    }
+    for term, pts in compound_terms.items():
+        if term in title:
+            penalty += pts
+
+    # A semicolon in a recto/verso-style title commonly indicates two distinct
+    # compositions catalogued under one object record.
+    if ";" in title and (has_recto or has_verso):
+        penalty -= 22
+
+    # Give true architectural/botanical single-sheet works a little protection
+    # from generic "study" wording in the medium/department metadata.
+    if "architectural" in blob and "studies" not in title and "sketches" not in title:
+        penalty += 8
+    if "botanical" in blob and "studies" not in title and "sketches" not in title:
+        penalty += 8
+
+    return penalty
+
+
 def metadata_score(a: dict[str, Any]) -> float:
     if not a.get("is_public_domain") or not a.get("image_url"):
         return -9999.0
@@ -247,6 +297,7 @@ def metadata_score(a: dict[str, Any]) -> float:
         score += 18
     if "black" in blob or "brown ink" in blob:
         score += 12
+    score += curation_penalty(a)
     return score
 
 
@@ -732,8 +783,16 @@ def pack_1bpp(img1: Image.Image) -> bytes:
     return bytes(out)
 
 
+def _artist_key(cand: Candidate) -> str:
+    artist = clean_text(cand.raw.get("artist_title") or cand.raw.get("artist_display"))
+    if not artist or artist.casefold() in {"unknown", "unknown artist", "anonymous", "unidentified"}:
+        # Do not make unrelated anonymous/unknown works collide with each other.
+        return f"unknown:{cand.id}"
+    return artist.casefold()
+
+
 def select_pack(evaluated: list[Candidate], count: int) -> list[Candidate]:
-    """Choose the final pack, strongly favoring horizontal active content."""
+    """Choose a landscape-oriented pack with one work per named artist when possible."""
     if count <= 0:
         return []
 
@@ -750,14 +809,13 @@ def select_pack(evaluated: list[Candidate], count: int) -> list[Candidate]:
     selected_ids: set[str] = set()
     artist_keys: set[str] = set()
 
-    def try_add(pool: list[Candidate], limit: int | None = None, enforce_artist_diversity: bool = True) -> None:
+    def try_add(pool: list[Candidate], limit: int | None = None, allow_duplicate_artist: bool = False) -> None:
         added = 0
         for cand in pool:
             if cand.id in selected_ids:
                 continue
-            artist = clean_text(cand.raw.get("artist_title") or cand.raw.get("artist_display"), "Unknown artist")
-            key = artist.casefold()
-            if enforce_artist_diversity and key in artist_keys and len(selected) < max(4, count // 2):
+            key = _artist_key(cand)
+            if not allow_duplicate_artist and key in artist_keys:
                 continue
             selected.append(cand)
             selected_ids.add(cand.id)
@@ -768,12 +826,8 @@ def select_pack(evaluated: list[Candidate], count: int) -> list[Candidate]:
             if len(selected) >= count:
                 break
 
+    # First pass: preserve artist diversity strictly.
     try_add(horizontals, target_horizontal)
-    horizontal_count = sum(c.orientation == "horizontal" for c in selected)
-    if horizontal_count < min_horizontal:
-        # Relax artist diversity before sacrificing the desired frame orientation.
-        try_add(horizontals, min_horizontal - horizontal_count, enforce_artist_diversity=False)
-
     remaining = count - len(selected)
     if remaining > 0:
         try_add(squares, remaining)
@@ -782,9 +836,47 @@ def select_pack(evaluated: list[Candidate], count: int) -> list[Candidate]:
         try_add(verticals, min(max_vertical, remaining))
     remaining = count - len(selected)
     if remaining > 0:
-        # Final safety fill: quality order wins if the strict mix cannot produce
-        # a complete pack. This avoids a failed daily build solely due to aspect.
-        try_add(ranked, remaining, enforce_artist_diversity=False)
+        try_add(ranked, remaining)
+
+    # If strict artist diversity leaves us short, only then allow repeats. Favor
+    # horizontal works first so the physical frame orientation still wins.
+    remaining = count - len(selected)
+    if remaining > 0:
+        try_add(horizontals, remaining, allow_duplicate_artist=True)
+    remaining = count - len(selected)
+    if remaining > 0:
+        try_add(squares, remaining, allow_duplicate_artist=True)
+    remaining = count - len(selected)
+    if remaining > 0 and max_vertical > 0:
+        current_verticals = sum(c.orientation == "vertical" for c in selected)
+        allowance = max(0, max_vertical - current_verticals)
+        if allowance:
+            try_add(verticals, min(allowance, remaining), allow_duplicate_artist=True)
+    remaining = count - len(selected)
+    if remaining > 0:
+        try_add(ranked, remaining, allow_duplicate_artist=True)
+
+    # When the candidate pool supports it, the orientation target should still
+    # be met. If not, return the highest-quality complete diverse pack rather
+    # than failing the daily build.
+    horizontal_count = sum(c.orientation == "horizontal" for c in selected)
+    if len(horizontals) >= min_horizontal and horizontal_count < min_horizontal:
+        # Swap the lowest-ranked non-horizontal selections with unused unique
+        # horizontals before considering duplicate artists.
+        unused_h = [c for c in horizontals if c.id not in selected_ids]
+        non_h = [c for c in reversed(selected) if c.orientation != "horizontal"]
+        for replacement, outgoing in zip(unused_h, non_h):
+            if horizontal_count >= min_horizontal:
+                break
+            key = _artist_key(replacement)
+            remaining_artist_keys = {_artist_key(c) for c in selected if c.id != outgoing.id}
+            if key in remaining_artist_keys:
+                continue
+            idx = selected.index(outgoing)
+            selected[idx] = replacement
+            selected_ids.remove(outgoing.id)
+            selected_ids.add(replacement.id)
+            horizontal_count += 1
 
     return selected[:count]
 
@@ -1162,6 +1254,11 @@ def self_test() -> None:
     assert "Example Artist" in normalized["artist_title"]
     assert metadata_score(normalized) > 100
 
+    compound = dict(normalized)
+    compound["title"] = "View from My Window (recto); Soldier in a Landscape (verso)"
+    assert curation_penalty(compound) <= -100
+    assert metadata_score(compound) < metadata_score(normalized)
+
     copyrighted = dict(fake)
     copyrighted["share_license_status"] = "Copyrighted"
     assert normalize_artwork(copyrighted) is None
@@ -1197,6 +1294,20 @@ def self_test() -> None:
     assert len(chosen) == 8
     assert sum(c.orientation == "horizontal" for c in chosen) >= 5
     assert sum(c.orientation == "vertical" for c in chosen) <= 1
+    named_artists = [_artist_key(c) for c in chosen if not _artist_key(c).startswith("unknown:")]
+    assert len(named_artists) == len(set(named_artists))
+
+    # Artist diversity should beat a second high-scoring work by the same artist
+    # whenever a suitable different artist exists.
+    diversity_pool: list[Candidate] = []
+    for i, (artist, score) in enumerate((("Same Artist", 300), ("Same Artist", 295), ("Other Artist", 280))):
+        work = dict(normalized)
+        work["id"] = 4000 + i
+        work["accession_number"] = f"D{i}"
+        work["artist_title"] = artist
+        diversity_pool.append(Candidate(work, score, "test", orientation="horizontal", active_aspect=1.6))
+    diversity_choice = select_pack(diversity_pool, 2)
+    assert {_artist_key(c) for c in diversity_choice} == {"same artist", "other artist"}
 
     # Active-content geometry must preserve real source aspect ratio even though
     # analysis uses a square thumbnail internally.
