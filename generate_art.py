@@ -127,6 +127,9 @@ class Candidate:
     preview_bw: Image.Image | None = None
     preview_ink: float = 0.0
     preview_content_ink: float = 0.0
+    aspect_ratio: float = 1.0
+    orientation: str = "square"
+    active_fraction: float = 0.0
 
     @property
     def id(self) -> str:
@@ -638,6 +641,33 @@ def pack_1bpp(img1: Image.Image) -> bytes:
     return bytes(out)
 
 
+def classify_orientation(ratio: float) -> str:
+    if ratio >= 1.15:
+        return "horizontal"
+    if ratio >= 0.90:
+        return "square"
+    return "vertical"
+
+
+def aspect_score(ratio: float) -> float:
+    """Landscape-biased score tuned for an 800x480 horizontal frame."""
+    if ratio <= 0:
+        return -120.0
+    if 1.35 <= ratio <= 2.25:
+        return 52.0
+    if 1.15 <= ratio < 1.35:
+        return 34.0
+    if 2.25 < ratio <= 2.75:
+        return 28.0
+    if 0.90 <= ratio < 1.15:
+        return 6.0
+    if 0.72 <= ratio < 0.90:
+        return -38.0
+    if ratio < 0.72:
+        return -92.0
+    return -12.0
+
+
 def evaluate_candidates(session: requests.Session, candidates: list[Candidate], count: int) -> list[Candidate]:
     """Download, render and rank candidates for a light, paper-like e-paper result."""
     max_to_try = min(len(candidates), max(count * 18, 96))
@@ -649,6 +679,8 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             cropped = crop_scan_border(ImageOps.grayscale(image))
             metrics = image_metrics(cropped)
             active_fraction = active_area_fraction(cropped)
+            ratio = cropped.width / cropped.height if cropped.height else 1.0
+            orientation = classify_orientation(ratio)
 
             title = clean_text(c.raw.get("title"), "Untitled")
 
@@ -664,12 +696,18 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             if active_fraction < 0.18:
                 print(f"{i + 1:02d}/{max_to_try} reject tiny-content {title}")
                 continue
+            if ratio < 0.62 and visual_score(metrics) < 95:
+                print(f"{i + 1:02d}/{max_to_try} reject narrow-portrait ratio={ratio:.2f} {title}")
+                continue
 
             canvas, box = contain_on_canvas_with_box(cropped)
             c.content_box = box
             c.visual_score = visual_score(metrics)
             c.mode = choose_mode(metrics, metadata_blob(c.raw))
-            c.score += c.visual_score
+            c.aspect_ratio = ratio
+            c.orientation = orientation
+            c.active_fraction = active_fraction
+            c.score += c.visual_score + aspect_score(ratio)
             c.image = canvas.convert("RGB")
 
             bw, _, ink = render_candidate(c)
@@ -704,7 +742,8 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
             evaluated.append(c)
             print(
                 f"{i + 1:02d}/{max_to_try} score={c.score:6.1f} mode={c.mode:8s} "
-                f"ink={ink*100:4.1f}% content={content_ink*100:4.1f}% active={active_fraction*100:4.1f}% {title}"
+                f"ink={ink*100:4.1f}% content={content_ink*100:4.1f}% "
+                f"active={active_fraction*100:4.1f}% ratio={ratio:.2f} {orientation:10s} {title}"
             )
         except Exception as exc:
             print(f"image failed for {c.id}: {exc}")
@@ -716,24 +755,84 @@ def evaluate_candidates(session: requests.Session, candidates: list[Candidate], 
 
     evaluated.sort(key=lambda c: c.score, reverse=True)
 
+    # Compose a pack for the physical horizontal frame, not merely the gallery page.
+    # For an 8-work pack we target 6 landscape works (75%), allow square-ish works
+    # for variety, and cap true portrait works at one.
+    target_horizontal = max(1, math.ceil(count * 0.75))
+    min_horizontal = max(1, math.ceil(count * 0.625))
+    max_vertical = 1 if count >= 4 else 0
+
     selected: list[Candidate] = []
     artists: set[str] = set()
-    for c in evaluated:
-        artist = clean_text(c.raw.get("artist_title") or c.raw.get("artist_display"), "Unknown artist")
-        key = artist.casefold()
-        if key in artists and len(selected) < max(4, count // 2):
-            continue
+
+    def artist_key(c: Candidate) -> str:
+        return clean_text(c.raw.get("artist_title") or c.raw.get("artist_display"), "Unknown artist").casefold()
+
+    def add_candidate(c: Candidate, enforce_artist_diversity: bool = True) -> bool:
+        if c in selected:
+            return False
+        key = artist_key(c)
+        if enforce_artist_diversity and key in artists:
+            return False
         selected.append(c)
         artists.add(key)
-        if len(selected) == count:
-            return selected
+        return True
 
+    horizontals = [c for c in evaluated if c.orientation == "horizontal"]
+    squares = [c for c in evaluated if c.orientation == "square"]
+    verticals = [c for c in evaluated if c.orientation == "vertical"]
+
+    # First reserve the majority of the pack for works that naturally fit 800x480.
+    for c in horizontals:
+        if len([x for x in selected if x.orientation == "horizontal"]) >= target_horizontal:
+            break
+        add_candidate(c, enforce_artist_diversity=True)
+
+    # If artist diversity prevented the landscape target, relax only that constraint.
+    for c in horizontals:
+        if len([x for x in selected if x.orientation == "horizontal"]) >= target_horizontal:
+            break
+        add_candidate(c, enforce_artist_diversity=False)
+
+    # Fill remaining slots primarily with square-ish works.
+    for c in squares:
+        if len(selected) >= count:
+            break
+        add_candidate(c, enforce_artist_diversity=True)
+    for c in squares:
+        if len(selected) >= count:
+            break
+        add_candidate(c, enforce_artist_diversity=False)
+
+    # Permit at most one portrait as a special piece, and only after horizontal/square.
+    vertical_added = 0
+    for c in verticals:
+        if len(selected) >= count or vertical_added >= max_vertical:
+            break
+        if add_candidate(c, enforce_artist_diversity=True):
+            vertical_added += 1
+    for c in verticals:
+        if len(selected) >= count or vertical_added >= max_vertical:
+            break
+        if add_candidate(c, enforce_artist_diversity=False):
+            vertical_added += 1
+
+    # If strict composition still left slots empty, use the best remaining works,
+    # but keep at least the minimum horizontal share whenever the pool supports it.
     for c in evaluated:
-        if c not in selected:
-            selected.append(c)
-            if len(selected) == count:
-                break
-    return selected
+        if len(selected) >= count:
+            break
+        current_h = sum(x.orientation == "horizontal" for x in selected)
+        remaining_slots = count - len(selected)
+        if current_h < min_horizontal and remaining_slots <= (min_horizontal - current_h):
+            if c.orientation != "horizontal":
+                continue
+        if c.orientation == "vertical" and sum(x.orientation == "vertical" for x in selected) >= max_vertical:
+            continue
+        add_candidate(c, enforce_artist_diversity=False)
+
+    selected.sort(key=lambda c: c.score, reverse=True)
+    return selected[:count]
 
 
 def render_candidate(c: Candidate) -> tuple[Image.Image, bytes, float]:
@@ -833,6 +932,8 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         f"museum={MUSEUM}",
         f"source={src}",
         f"mode={c.mode}",
+        f"orientation={c.orientation}",
+        f"aspect={c.aspect_ratio:.2f}",
         f"ink={ink * 100:.1f}",
         f"content_ink={c.preview_content_ink * 100:.1f}",
         f"bytes={len(packed)}",
@@ -849,6 +950,8 @@ def write_slot(out: Path, pack: str, slot: int, count: int, c: Candidate) -> dic
         "museum": MUSEUM,
         "source": src,
         "mode": c.mode,
+        "orientation": c.orientation,
+        "aspect": round(c.aspect_ratio, 2),
         "ink": round(ink * 100, 1),
         "content_ink": round(c.preview_content_ink * 100, 1),
         "bytes": len(packed),
@@ -863,6 +966,8 @@ def write_gallery_html(site_dir: Path, pack: str, works: list[dict[str, Any]]) -
         artist = html.escape(str(work["artist"]), quote=True)
         date = html.escape(str(work["date"]), quote=True)
         mode = html.escape(str(work["mode"]), quote=True)
+        orientation = html.escape(str(work.get("orientation", "?")), quote=True)
+        aspect = html.escape(str(work.get("aspect", "?")), quote=True)
         ink = html.escape(str(work.get("ink", "?")), quote=True)
         content_ink = html.escape(str(work.get("content_ink", "?")), quote=True)
         source = html.escape(str(work["source"]), quote=True)
@@ -870,7 +975,7 @@ def write_gallery_html(site_dir: Path, pack: str, works: list[dict[str, Any]]) -
         cards.append(
             f'<article><img src="feed/slot{slot}.png" alt="{title}">'
             f"<h2>{title}</h2><p>{artist}</p>"
-            f'<p class="muted">{date} · {mode} · {ink}% frame ink · {content_ink}% artwork ink</p>'
+            f'<p class="muted">{date} · {orientation} {aspect}:1 · {mode} · {ink}% frame ink · {content_ink}% artwork ink</p>'
             f'<a href="{source}" rel="noopener">Museum record</a></article>'
         )
 
@@ -971,6 +1076,12 @@ def self_test() -> None:
     copyrighted = dict(fake)
     copyrighted["share_license_status"] = "Copyrighted"
     assert normalize_artwork(copyrighted) is None
+
+    # Orientation bias checks for the physical 800x480 landscape frame.
+    assert classify_orientation(1.50) == "horizontal"
+    assert classify_orientation(1.00) == "square"
+    assert classify_orientation(0.75) == "vertical"
+    assert aspect_score(1.60) > aspect_score(1.00) > aspect_score(0.75)
 
     # Synthetic line + tone image test; no network required.
     img = Image.new("L", (W, H), 255)
