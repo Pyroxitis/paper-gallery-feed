@@ -1,6 +1,6 @@
-Paper Gallery Aerospace NTRS v2.1 — audited
+Paper Gallery Aerospace NTRS v2.2 — independently validated
 
-Replace these files in the root of the paper-gallery-feed GitHub repository:
+Upload/replace in the root of paper-gallery-feed:
   generate_aerospace.py
   requirements.txt
 
@@ -9,20 +9,27 @@ No daily-art.yml change is required if it already runs:
   python generate_aerospace.py --self-test
   python generate_aerospace.py --output site/feed/aerospace --site site/aerospace --count-per-category 4
 
-Audit fixes in v2.1:
-- Corrected NTRS report-number parsing for list/dict/scalar API shapes.
-- Hardened NTRS PDF-link selection and rejects non-PDF download entries.
-- Hardened booleans and rights checks; still requires PUBLIC + DOCUMENT_AND_METADATA,
-  explicit public-use copyright determination, no indicated third-party material, and no export restriction.
-- Added daily NTRS download/attempt budgets to keep GitHub Actions bounded.
-- Counts partially downloaded bytes against the daily budget.
-- Validates PDF magic bytes before opening with PDFium.
-- Scans a distributed sample across long reports rather than just the first pages.
-- Fixed the fallback-page sampler so small sample sizes still reach late pages.
-- Added render-pixel limits for giant PDF foldouts.
-- Reworked page scoring so blank/title pages are strongly penalized and technical structure is rewarded.
-- Prevents the same NTRS report from being reused across multiple categories in one daily pack.
-- Randomizes which categories get the limited NTRS slots so later categories are not permanently starved.
-- Fixed gallery source fallback for NTRS records without report numbers.
-- Expanded offline self-tests for rights parsing, report-number shapes, distributed page selection,
-  blank-page rejection, PDFium rendering, packing, and bit polarity.
+v2.2 fixes added after independent validation:
+- Scanned/image-only NTRS PDFs now reserve render slots for pages distributed across the full document, rather than allowing weak/equal text scores to bias rendering toward early pages.
+- An unexpected NTRS exception is isolated at the source-mixing layer; Commons continues building the Aerospace feed instead of the entire daily workflow failing.
+
+Validation performed on the exact packaged generator:
+- Python syntax and compileall checks.
+- Built-in offline self-test.
+- Independent 56-check harness covering:
+  * rights allow/deny matrix
+  * report/year/PDF-link parsing
+  * POST search and GET fallback behavior
+  * PDF size/magic/budget failure paths
+  * distributed long-report page sampling
+  * synthetic scanned multi-page PDF extraction
+  * technical-vs-blank/prose/noise page scoring
+  * 800x480 rendering and 48,000-byte packing
+  * all-slot CRC and metadata consistency
+  * contiguous category ranges
+  * stale slot cleanup
+  * deterministic output for a fixed selection/date
+  * graceful Commons fallback on unexpected NTRS failure
+- Installed dependency versions were checked against requirements specifiers.
+
+independent_validation.py is included for audit/reference; it is not required by GitHub Actions.

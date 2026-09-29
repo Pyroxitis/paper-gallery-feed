@@ -879,11 +879,37 @@ def extract_best_ntrs_page(session: requests.Session, record: NTRSRecord, budget
             text_scores.append((s_text, idx, page_text))
 
         text_scores.sort(key=lambda item: item[0], reverse=True)
-        candidate_indices: list[int] = [idx for _, idx, _ in text_scores[:8]]
-        for idx in _distributed_indices(page_count, 8):
+
+        # Balance text-guided pages with a broad document-wide sample. Some old
+        # NACA/NASA reports are image-only scans with little or no extractable
+        # text; selecting only the highest text scores would then bias heavily
+        # toward the first pages and can miss excellent drawings later on.
+        candidate_indices: list[int] = []
+        text_guided_cap = max(1, NTRS_MAX_PAGES_TO_RENDER // 2)
+        for text_score, idx, _ in text_scores:
+            if text_score <= 0:
+                continue
             if idx not in candidate_indices:
                 candidate_indices.append(idx)
-        candidate_indices = candidate_indices[:NTRS_MAX_PAGES_TO_RENDER]
+            if len(candidate_indices) >= text_guided_cap:
+                break
+
+        for idx in _distributed_indices(page_count, NTRS_MAX_PAGES_TO_RENDER):
+            if idx not in candidate_indices:
+                candidate_indices.append(idx)
+            if len(candidate_indices) >= NTRS_MAX_PAGES_TO_RENDER:
+                break
+
+        # If duplicate sampling left room, fill from the remaining text-ranked
+        # pages regardless of score. This keeps the render count bounded while
+        # avoiding gaps on short or oddly structured reports.
+        if len(candidate_indices) < NTRS_MAX_PAGES_TO_RENDER:
+            for _, idx, _ in text_scores:
+                if idx not in candidate_indices:
+                    candidate_indices.append(idx)
+                if len(candidate_indices) >= NTRS_MAX_PAGES_TO_RENDER:
+                    break
+
         text_by_index = {idx: txt for _, idx, txt in text_scores}
 
         best: tuple[float, float, int, Image.Image, str] | None = None
@@ -1280,7 +1306,14 @@ def build_selection(session: requests.Session, date_str: str, quota: int) -> lis
     for category in ntrs_order:
         if len(ntrs_by_category) >= NTRS_MAX_FEATURES_PER_DAY or not budget.can_attempt():
             break
-        candidate = gather_ntrs_feature(session, category, seed, budget, used_ntrs_records)
+        try:
+            candidate = gather_ntrs_feature(session, category, seed, budget, used_ntrs_records)
+        except Exception as exc:
+            # NTRS is an enrichment source, never a hard dependency. If NASA's
+            # API/PDF service changes unexpectedly, keep building the reliable
+            # Commons-backed feed rather than failing the entire daily gallery.
+            print(f"NTRS category failed [{category}]: {exc}")
+            candidate = None
         if candidate is not None:
             ntrs_by_category[category] = candidate
 
