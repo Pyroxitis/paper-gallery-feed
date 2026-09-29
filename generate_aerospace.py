@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Paper Gallery Aerospace Drawings feed generator.
 
-Phase 1 source: Wikimedia Commons only.
+Sources: Wikimedia Commons plus rights-checked NASA Technical Reports Server (NTRS).
 
 The generator searches Commons for aerospace technical imagery, verifies each
 file is explicitly Public Domain or CC0 using Commons extended image metadata,
@@ -9,8 +9,8 @@ converts suitable imagery to a captioned 800x480 1-bit e-paper frame, and
 publishes one master Aerospace feed. Each slot carries a category; the ESP32
 filters the pack locally when the user chooses a category.
 
-Future source adapters can add NTRS PDF-page extraction, Library of Congress,
-and Smithsonian Open Access without changing the ESP32 feed format.
+NTRS PDF pages are ranked and rendered automatically; future adapters can add
+Library of Congress and Smithsonian Open Access without changing the ESP32 feed format.
 """
 
 from __future__ import annotations
@@ -31,12 +31,15 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+NTRS_API = "https://ntrs.nasa.gov/api"
 SOURCE_NAME = "Wikimedia Commons"
+NTRS_SOURCE_NAME = "NASA Technical Reports Server"
 W, H = 800, 480
 CAPTION_H = 66
 ART_H = H - CAPTION_H
@@ -145,6 +148,89 @@ SEARCHES = {
     ],
 }
 
+NTRS_SEARCHES = {
+    "aircraft-three-views": [
+        "three-view drawing aircraft",
+        "aircraft configuration drawing",
+        "general arrangement aircraft",
+    ],
+    "x-planes-experimental": [
+        "research aircraft configuration",
+        "experimental aircraft configuration",
+        "lifting body configuration",
+        "supersonic research aircraft",
+    ],
+    "spacecraft": [
+        "spacecraft configuration diagram",
+        "spacecraft general arrangement",
+        "Apollo spacecraft configuration",
+        "lifting body spacecraft configuration",
+    ],
+    "rockets-launch-vehicles": [
+        "launch vehicle configuration",
+        "rocket configuration diagram",
+        "Saturn launch vehicle configuration",
+    ],
+    "aerodynamics": [
+        "aerodynamic configuration figure",
+        "aerodynamic study aircraft configuration",
+        "flow field diagram aircraft",
+    ],
+    "propulsion": [
+        "engine schematic propulsion",
+        "turbojet schematic",
+        "rocket engine schematic",
+        "propulsion system diagram",
+    ],
+    "wind-tunnel-models": [
+        "wind tunnel model configuration",
+        "wind-tunnel model drawing",
+        "wind tunnel test model",
+    ],
+    "airfoils": [
+        "airfoil section figure",
+        "airfoil profile NACA",
+        "wing section airfoil",
+    ],
+    "historical-aviation": [
+        "NACA aircraft configuration",
+        "NACA aircraft drawing",
+        "NACA aircraft circular",
+    ],
+    "odd-abandoned-concepts": [
+        "advanced aircraft concept configuration",
+        "unconventional aircraft configuration",
+        "supersonic transport concept",
+        "lifting body concept",
+    ],
+}
+
+NTRS_PAGE_TERMS = {
+    "aircraft-three-views": ("three-view", "3-view", "general arrangement", "configuration", "planform", "side view", "front view"),
+    "x-planes-experimental": ("configuration", "research aircraft", "experimental", "lifting body", "concept", "general arrangement"),
+    "spacecraft": ("spacecraft", "configuration", "arrangement", "capsule", "module", "vehicle"),
+    "rockets-launch-vehicles": ("launch vehicle", "rocket", "configuration", "stage", "booster", "vehicle"),
+    "aerodynamics": ("aerodynamic", "flow", "pressure", "configuration", "mach", "model"),
+    "propulsion": ("engine", "propulsion", "turbine", "compressor", "nozzle", "schematic", "combustor"),
+    "wind-tunnel-models": ("wind tunnel", "model", "test configuration", "sting", "tunnel"),
+    "airfoils": ("airfoil", "section", "profile", "wing section", "coordinates"),
+    "historical-aviation": ("aircraft", "configuration", "NACA", "arrangement", "drawing"),
+    "odd-abandoned-concepts": ("concept", "configuration", "advanced", "unconventional", "lifting body", "supersonic"),
+}
+
+NTRS_RIGHTS_ALLOW = {
+    "GOV_PUBLIC_USE_PERMITTED",
+    "PUBLIC_USE_PERMITTED",
+}
+NTRS_MAX_PDF_BYTES = 30 * 1024 * 1024
+NTRS_MAX_PAGES_TO_RENDER = 12
+NTRS_MAX_FEATURES_PER_DAY = 7
+NTRS_MAX_PDF_ATTEMPTS_PER_DAY = 12
+NTRS_MAX_PDF_ATTEMPTS_PER_CATEGORY = 2
+NTRS_MAX_PDF_BYTES_PER_DAY = 180 * 1024 * 1024
+NTRS_MAX_PAGES_TO_INSPECT = 120
+NTRS_MAX_RENDER_PIXELS = 4_500_000
+
 TECHNICAL_TERMS = (
     "drawing", "diagram", "schematic", "three-view", "3-view", "orthographic",
     "configuration", "plan", "section", "cutaway", "profile", "airfoil", "model",
@@ -177,6 +263,10 @@ class Candidate:
     search_term: str
     width: int
     height: int
+    source_kind: str = "commons"
+    source_name: str = SOURCE_NAME
+    source_id: str = ""
+    pdf_page: int = 0
     report: str = ""
     year: str = ""
     score: float = 0.0
@@ -185,7 +275,42 @@ class Candidate:
 
     @property
     def id(self) -> str:
+        if self.source_kind == "ntrs":
+            return f"ntrs-{self.source_id}-p{self.pdf_page}"
         return f"commons-{self.pageid}"
+
+
+@dataclass
+class NTRSRecord:
+    record_id: str
+    title: str
+    abstract: str
+    category: str
+    report: str
+    year: str
+    citation_url: str
+    pdf_url: str
+    rights: str
+    subject_text: str
+    score: float = 0.0
+
+
+@dataclass
+class NTRSBudget:
+    attempts: int = 0
+    bytes_downloaded: int = 0
+
+    def can_attempt(self) -> bool:
+        return (
+            self.attempts < NTRS_MAX_PDF_ATTEMPTS_PER_DAY
+            and self.bytes_downloaded < NTRS_MAX_PDF_BYTES_PER_DAY
+        )
+
+    def note_attempt(self) -> None:
+        self.attempts += 1
+
+    def note_bytes(self, count: int) -> None:
+        self.bytes_downloaded += max(0, int(count))
 
 
 # -------------------- Generic helpers --------------------
@@ -220,7 +345,7 @@ def make_session() -> requests.Session:
         status=4,
         backoff_factor=0.7,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
+        allowed_methods=frozenset({"GET", "POST"}),
         respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=6, pool_maxsize=6)
@@ -417,6 +542,464 @@ def gather_category(session: requests.Session, category: str, seed: int) -> list
     return found
 
 
+# -------------------- NTRS discovery, rights, and PDF extraction --------------------
+
+def _ntrs_first_report_number(record: dict[str, Any]) -> str:
+    values: list[str] = []
+    for key in ("reportNumbers", "otherReportNumbers"):
+        raw = record.get(key)
+        items = raw if isinstance(raw, list) else ([] if raw in (None, "") else [raw])
+        for item in items:
+            if isinstance(item, dict):
+                value = clean_html_text(item.get("number") or item.get("reportNumber"))
+            else:
+                value = clean_html_text(item)
+            if value:
+                values.append(value)
+    return values[0][:72] if values else ""
+
+
+def _ntrs_year(record: dict[str, Any]) -> str:
+    publications = record.get("publications") or []
+    if isinstance(publications, list):
+        for pub in publications:
+            if isinstance(pub, dict):
+                value = clean_html_text(pub.get("publicationDate"))
+                m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\b", value)
+                if m:
+                    return m.group(1)
+    for key in ("publicationDate", "distributionDate", "submittedDate", "created"):
+        value = clean_html_text(record.get(key))
+        m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\b", value)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _ntrs_pdf_link(record: dict[str, Any]) -> str:
+    downloads = record.get("downloads") or []
+    if isinstance(downloads, dict):
+        downloads = [downloads]
+    if not isinstance(downloads, list):
+        return ""
+
+    ranked: list[tuple[int, str]] = []
+    for item in downloads:
+        if not isinstance(item, dict) or item.get("draft") is True:
+            continue
+        mimetype = clean_html_text(item.get("mimetype")).casefold()
+        name = clean_html_text(item.get("name")).casefold()
+        if mimetype != "application/pdf" and not name.endswith(".pdf"):
+            continue
+        links = item.get("links") or {}
+        if not isinstance(links, dict):
+            continue
+        for rank, key in ((0, "pdf"), (1, "original")):
+            link = clean_html_text(links.get(key))
+            if not link:
+                continue
+            if not (link.startswith("http://") or link.startswith("https://")):
+                link = "https://ntrs.nasa.gov" + (link if link.startswith("/") else "/" + link)
+            ranked.append((rank, link))
+    if not ranked:
+        return ""
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][1]
+
+
+def _as_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = clean_html_text(value).casefold()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def ntrs_rights_allowed(record: dict[str, Any]) -> tuple[bool, str]:
+    """Conservative rights gate for publishing a derived display image."""
+    if clean_html_text(record.get("distribution")).upper() != "PUBLIC":
+        return False, ""
+    if clean_html_text(record.get("disseminated")).upper() != "DOCUMENT_AND_METADATA":
+        return False, ""
+    if _as_bool(record.get("downloadsAvailable")) is not True:
+        return False, ""
+
+    export = record.get("exportControl") or {}
+    if not isinstance(export, dict):
+        return False, ""
+    for key in ("itar", "ear"):
+        value = clean_html_text(export.get(key)).upper()
+        if value not in {"", "NO"}:
+            return False, ""
+
+    copyright_meta = record.get("copyright") or {}
+    if not isinstance(copyright_meta, dict):
+        return False, ""
+    determination = clean_html_text(copyright_meta.get("determinationType")).upper()
+    if determination not in NTRS_RIGHTS_ALLOW:
+        return False, ""
+    if _as_bool(copyright_meta.get("containsThirdPartyMaterial")) is True:
+        return False, ""
+    third_party = clean_html_text(copyright_meta.get("thirdPartyContentCondition")).upper()
+    if third_party not in {"", "NOT_SET"}:
+        return False, ""
+    return True, determination
+
+
+def ntrs_search(session: requests.Session, query: str, category: str, limit: int = 12) -> list[NTRSRecord]:
+    limit = max(1, min(int(limit), 100))
+    body = {
+        "q": query,
+        "disseminated": "DOCUMENT_AND_METADATA",
+        "page": {"size": limit, "from": 0},
+    }
+    url = f"{NTRS_API}/citations/search"
+    try:
+        response = session.post(url, json=body, timeout=(10, 40))
+        response.raise_for_status()
+    except requests.RequestException as post_exc:
+        params = {
+            "q": query,
+            "disseminated": "DOCUMENT_AND_METADATA",
+            "page.size": limit,
+            "page.from": 0,
+        }
+        try:
+            response = session.get(url, params=params, timeout=(10, 40))
+            response.raise_for_status()
+        except requests.RequestException:
+            raise post_exc
+
+    payload = response.json()
+    rows = payload.get("results", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        raise RuntimeError("NTRS search returned an unexpected response shape")
+
+    out: list[NTRSRecord] = []
+    for record in rows:
+        if not isinstance(record, dict):
+            continue
+        allowed, rights = ntrs_rights_allowed(record)
+        if not allowed:
+            continue
+        pdf_url = _ntrs_pdf_link(record)
+        if not pdf_url:
+            continue
+        record_id = clean_html_text(record.get("id"))
+        if not record_id or not re.fullmatch(r"\d+", record_id):
+            continue
+        title = clean_html_text(record.get("title")) or f"NASA report {record_id}"
+        abstract = clean_html_text(record.get("abstract"))
+        subjects = clean_html_text(record.get("subjectCategories"))
+        report = _ntrs_first_report_number(record)
+        year = _ntrs_year(record)
+        blob = f"{title} {abstract} {subjects} {report}".casefold()
+        score = 0.0
+        for term in NTRS_PAGE_TERMS.get(category, ()):
+            if term.casefold() in blob:
+                score += 12
+        if "naca" in blob:
+            score += 20
+        if "nasa" in blob:
+            score += 8
+        if report:
+            score += 8
+        out.append(NTRSRecord(
+            record_id=record_id,
+            title=title,
+            abstract=abstract,
+            category=category,
+            report=report,
+            year=year,
+            citation_url=f"https://ntrs.nasa.gov/citations/{record_id}",
+            pdf_url=pdf_url,
+            rights=rights,
+            subject_text=subjects,
+            score=score,
+        ))
+    out.sort(key=lambda x: x.score, reverse=True)
+    return out
+
+
+def _ntrs_page_text(page: Any) -> str:
+    try:
+        textpage = page.get_textpage()
+        try:
+            return clean_html_text(textpage.get_text_bounded())
+        finally:
+            textpage.close()
+    except Exception:
+        return ""
+
+
+def _ntrs_page_score(gray: Image.Image, text: str, category: str) -> float:
+    """Score for display-worthiness; do not reward nearly blank title pages."""
+    m = image_metrics(gray)
+    nonwhite = max(0.0, 1.0 - m["white"])
+    score = 0.0
+    if nonwhite < 0.010:
+        score -= 120
+    elif nonwhite < 0.025:
+        score -= 45
+    elif nonwhite <= 0.30:
+        score += 35
+    else:
+        score -= (nonwhite - 0.30) * 180
+
+    score += min(m["edge"] / 22.0, 1.8) * 48
+    score += min(m["std"] / 55.0, 1.5) * 26
+    if m["edge"] < 2.0:
+        score -= 55
+    if m["std"] < 8.0:
+        score -= 45
+    if m["mean"] < 145:
+        score -= (145 - m["mean"]) * 1.5
+    if m["dark"] > 0.25:
+        score -= (m["dark"] - 0.25) * 260
+
+    folded = text.casefold()
+    signal_terms = 0
+    for term in NTRS_PAGE_TERMS.get(category, ()):
+        if term.casefold() in folded:
+            score += 16
+            signal_terms += 1
+    if "figure" in folded:
+        score += 10
+        signal_terms += 1
+    if "schematic" in folded or "configuration" in folded or "drawing" in folded:
+        score += 12
+        signal_terms += 1
+
+    chars = len(text)
+    if chars > 3600:
+        score -= 150
+    elif chars > 2400:
+        score -= 90
+    elif chars > 1500:
+        score -= 45
+    elif chars > 900:
+        score -= 15
+    if signal_terms == 0 and m["edge"] < 5.0:
+        score -= 35
+    return score
+
+
+def _download_pdf(session: requests.Session, record: NTRSRecord, budget: NTRSBudget) -> bytes:
+    if not budget.can_attempt():
+        raise RuntimeError("NTRS daily PDF budget exhausted")
+    budget.note_attempt()
+    with session.get(record.pdf_url, timeout=(10, 75), stream=True) as response:
+        response.raise_for_status()
+        try:
+            declared = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared and declared > NTRS_MAX_PDF_BYTES:
+            raise RuntimeError(f"NTRS PDF too large ({declared / 1048576:.1f} MB)")
+        if declared and budget.bytes_downloaded + declared > NTRS_MAX_PDF_BYTES_PER_DAY:
+            raise RuntimeError("NTRS daily byte budget would be exceeded")
+
+        data = bytearray()
+        for chunk in response.iter_content(1024 * 256):
+            if not chunk:
+                continue
+            data.extend(chunk)
+            budget.note_bytes(len(chunk))
+            if len(data) > NTRS_MAX_PDF_BYTES:
+                raise RuntimeError("NTRS PDF exceeded per-file size limit")
+            if budget.bytes_downloaded > NTRS_MAX_PDF_BYTES_PER_DAY:
+                raise RuntimeError("NTRS daily byte budget exceeded")
+
+    if not data:
+        raise RuntimeError("NTRS returned an empty PDF")
+    if not bytes(data[:1024]).lstrip().startswith(b"%PDF-"):
+        raise RuntimeError("NTRS download was not a PDF")
+    return bytes(data)
+
+
+def _distributed_indices(page_count: int, cap: int) -> list[int]:
+    if page_count <= 0 or cap <= 0:
+        return []
+    if page_count <= cap:
+        return list(range(page_count))
+
+    # Reserve only part of the budget for early pages; spread the rest across
+    # the full document. This matters for small caps too (e.g. 8 fallbacks).
+    early_count = min(page_count, min(18, max(2, cap // 4)))
+    early = list(range(early_count))
+    remaining = max(0, cap - len(early))
+    sampled = [
+        round((page_count - 1) * i / max(1, remaining - 1))
+        for i in range(remaining)
+    ] if remaining else []
+    out: list[int] = []
+    for idx in early + sampled:
+        if 0 <= idx < page_count and idx not in out:
+            out.append(idx)
+    # Rounding/duplicates can make the list short. Fill deterministically.
+    if len(out) < cap:
+        for idx in range(page_count):
+            if idx not in out:
+                out.append(idx)
+                if len(out) >= cap:
+                    break
+    return out[:cap]
+
+
+def extract_best_ntrs_page(session: requests.Session, record: NTRSRecord, budget: NTRSBudget) -> Candidate | None:
+    data = _download_pdf(session, record, budget)
+    pdf = pdfium.PdfDocument(data)
+    try:
+        page_count = len(pdf)
+        if page_count <= 0:
+            return None
+
+        text_scores: list[tuple[float, int, str]] = []
+        inspect_indices = _distributed_indices(page_count, NTRS_MAX_PAGES_TO_INSPECT)
+        for idx in inspect_indices:
+            page = pdf[idx]
+            try:
+                page_text = _ntrs_page_text(page)
+            finally:
+                page.close()
+            folded = page_text.casefold()
+            s_text = 0.0
+            for term in NTRS_PAGE_TERMS.get(record.category, ()):
+                if term.casefold() in folded:
+                    s_text += 10
+            if "figure" in folded:
+                s_text += 4
+            if "schematic" in folded or "drawing" in folded or "configuration" in folded:
+                s_text += 4
+            if len(page_text) > 3000:
+                s_text -= 20
+            text_scores.append((s_text, idx, page_text))
+
+        text_scores.sort(key=lambda item: item[0], reverse=True)
+        candidate_indices: list[int] = [idx for _, idx, _ in text_scores[:8]]
+        for idx in _distributed_indices(page_count, 8):
+            if idx not in candidate_indices:
+                candidate_indices.append(idx)
+        candidate_indices = candidate_indices[:NTRS_MAX_PAGES_TO_RENDER]
+        text_by_index = {idx: txt for _, idx, txt in text_scores}
+
+        best: tuple[float, float, int, Image.Image, str] | None = None
+        for idx in candidate_indices:
+            page = pdf[idx]
+            try:
+                page_w, page_h = page.get_size()
+                if page_w <= 0 or page_h <= 0:
+                    continue
+                target_scale = max(0.75, min(2.0, 1350.0 / page_w))
+                max_scale_by_pixels = math.sqrt(NTRS_MAX_RENDER_PIXELS / max(1.0, page_w * page_h))
+                scale = min(target_scale, max_scale_by_pixels)
+                # Extremely large foldouts can otherwise explode memory usage.
+                if scale < 0.20:
+                    continue
+                bitmap = page.render(scale=scale, rotation=0)
+                try:
+                    pil = bitmap.to_pil().convert("RGB").copy()
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+
+            gray = crop_scan_border(ImageOps.grayscale(pil))
+            text_here = text_by_index.get(idx, "")
+            page_score = _ntrs_page_score(gray, text_here, record.category)
+            total_score = record.score + page_score
+            if page_score < 12:
+                continue
+            if best is None or total_score > best[0]:
+                best = (total_score, page_score, idx, gray, text_here)
+
+        if best is None:
+            return None
+        score, page_score, page_index, gray, page_text = best
+        synthetic_pageid = -(int(record.record_id) * 1000 + page_index + 1)
+        candidate = Candidate(
+            pageid=synthetic_pageid,
+            file_title=f"NTRS:{record.record_id}:page:{page_index + 1}",
+            image_url="",
+            description_url=record.citation_url,
+            title=record.title[:120],
+            description=record.abstract,
+            artist="NASA / NACA",
+            date_text=record.year,
+            categories_text=record.subject_text,
+            license_short=record.rights.replace("_", " ").title(),
+            copyright_status="False",
+            restrictions="",
+            category=record.category,
+            search_term="NTRS",
+            width=gray.width,
+            height=gray.height,
+            source_kind="ntrs",
+            source_name=NTRS_SOURCE_NAME,
+            source_id=record.record_id,
+            pdf_page=page_index + 1,
+            report=record.report,
+            year=record.year,
+            score=score,
+        )
+        frame, ink = render_frame(candidate, gray)
+        if not (0.020 <= ink <= 0.235):
+            return None
+        candidate.frame = frame
+        candidate.ink = ink
+        return candidate
+    finally:
+        pdf.close()
+
+
+def gather_ntrs_feature(
+    session: requests.Session,
+    category: str,
+    seed: int,
+    budget: NTRSBudget,
+    used_record_ids: set[str],
+) -> Candidate | None:
+    if not budget.can_attempt():
+        return None
+    rng = random.Random(seed ^ 0x4E545253 ^ sum(ord(ch) for ch in category))
+    queries = list(NTRS_SEARCHES.get(category, ()))
+    rng.shuffle(queries)
+    seen: set[str] = set()
+    records: list[NTRSRecord] = []
+    for query in queries[:3]:
+        try:
+            for record in ntrs_search(session, query, category, limit=10):
+                if record.record_id in seen or record.record_id in used_record_ids:
+                    continue
+                seen.add(record.record_id)
+                record.score += rng.uniform(-5, 5)
+                records.append(record)
+        except Exception as exc:
+            print(f"NTRS search failed [{category}] {query!r}: {exc}")
+        time.sleep(0.20)
+    records.sort(key=lambda x: x.score, reverse=True)
+
+    for record in records[:NTRS_MAX_PDF_ATTEMPTS_PER_CATEGORY]:
+        if not budget.can_attempt():
+            break
+        try:
+            candidate = extract_best_ntrs_page(session, record, budget)
+            if candidate is not None:
+                used_record_ids.add(record.record_id)
+                print(
+                    f"[{category}] NTRS page={candidate.pdf_page} ink={candidate.ink*100:4.1f}% "
+                    f"rights={candidate.license_short!r} {candidate.title}"
+                )
+                return candidate
+        except Exception as exc:
+            print(f"NTRS PDF failed {record.record_id}: {exc}")
+        time.sleep(0.25)
+    return None
+
+
 # -------------------- Image processing --------------------
 
 def download_image(session: requests.Session, c: Candidate) -> Image.Image:
@@ -573,7 +1156,7 @@ def caption_source_line(c: Candidate) -> str:
     if c.report:
         pieces.append(c.report)
     else:
-        pieces.append(SOURCE_NAME)
+        pieces.append(c.source_name)
     if c.year:
         pieces.append(c.year)
     return " · ".join(pieces)
@@ -648,6 +1231,8 @@ def evaluate_category(
     quota: int,
     globally_used: set[int],
 ) -> list[Candidate]:
+    if quota <= 0:
+        return []
     accepted: list[Candidate] = []
     # Try deeper than quota because rights-safe search results can still be photos
     # or poor 1-bit candidates.
@@ -686,23 +1271,43 @@ def build_selection(session: requests.Session, date_str: str, quota: int) -> lis
     seed = int(date_str.replace("-", ""))
     globally_used: set[int] = set()
     selected: list[Candidate] = []
-    reserve: list[Candidate] = []
+
+    budget = NTRSBudget()
+    used_ntrs_records: set[str] = set()
+    ntrs_by_category: dict[str, Candidate] = {}
+    ntrs_order = CATEGORY_ORDER[:]
+    random.Random(seed ^ 0x4E545253).shuffle(ntrs_order)
+    for category in ntrs_order:
+        if len(ntrs_by_category) >= NTRS_MAX_FEATURES_PER_DAY or not budget.can_attempt():
+            break
+        candidate = gather_ntrs_feature(session, category, seed, budget, used_ntrs_records)
+        if candidate is not None:
+            ntrs_by_category[category] = candidate
+
+    print(
+        f"NTRS daily budget: {budget.attempts} PDF attempts, "
+        f"{budget.bytes_downloaded / 1048576:.1f} MB downloaded, "
+        f"{len(ntrs_by_category)} selected"
+    )
 
     for category in CATEGORY_ORDER:
-        candidates = gather_category(session, category, seed)
-        # Keep spare candidates for categories that fail to fill.
-        chosen = evaluate_category(session, category, candidates, quota, globally_used)
-        selected.extend(chosen)
-        if len(chosen) < quota:
-            print(f"WARNING: {CATEGORY_LABELS[category]} produced {len(chosen)}/{quota} works")
-        # Unselected top candidates may be usable as a final random fallback.
-        reserve.extend([c for c in candidates if c.pageid not in globally_used])
+        category_selected: list[Candidate] = []
+        ntrs_candidate = ntrs_by_category.get(category)
+        if ntrs_candidate is not None and ntrs_candidate.pageid not in globally_used:
+            category_selected.append(ntrs_candidate)
+            globally_used.add(ntrs_candidate.pageid)
 
-    # A daily pack should remain usable even if one narrow search temporarily
-    # underperforms. Random mode can use every selected slot; category mode simply
-    # shows however many slots that category has that day.
+        commons_candidates = gather_category(session, category, seed)
+        commons_quota = max(0, quota - len(category_selected))
+        chosen_commons = evaluate_category(session, category, commons_candidates, commons_quota, globally_used)
+        category_selected.extend(chosen_commons)
+        selected.extend(category_selected)
+
+        if len(category_selected) < quota:
+            print(f"WARNING: {CATEGORY_LABELS[category]} produced {len(category_selected)}/{quota} works")
+
     if not selected:
-        raise RuntimeError("No rights-cleared aerospace drawings could be selected from Wikimedia Commons")
+        raise RuntimeError("No rights-cleared aerospace drawings could be selected")
     return selected
 
 
@@ -741,7 +1346,7 @@ def write_slot(out: Path, pack: str, slot: int, total: int, c: Candidate) -> dic
         f"title={c.title}",
         f"artist={clean_html_text(c.artist) or 'NASA / NACA / aerospace source'}",
         f"date={c.year}",
-        f"museum={SOURCE_NAME}",
+        f"museum={c.source_name}",
         f"source={c.description_url}",
         f"category={c.category}",
         f"category_label={CATEGORY_LABELS[c.category]}",
@@ -761,6 +1366,9 @@ def write_slot(out: Path, pack: str, slot: int, total: int, c: Candidate) -> dic
         "report": c.report,
         "year": c.year,
         "source": c.description_url,
+        "source_name": c.source_name,
+        "source_kind": c.source_kind,
+        "pdf_page": c.pdf_page,
         "license": c.license_short,
         "ink": round(c.ink * 100, 1),
         "crc32": f"{crc:08X}",
@@ -780,15 +1388,17 @@ def write_gallery(site: Path, pack: str, works: list[dict[str, Any]]) -> None:
             slot = int(w["slot"])
             title = html.escape(str(w["title"]))
             source = html.escape(str(w["source"]), quote=True)
-            report = html.escape(str(w.get("report") or SOURCE_NAME))
+            report = html.escape(str(w.get("report") or w.get("source_name") or SOURCE_NAME))
             year = html.escape(str(w.get("year") or ""))
             lic = html.escape(str(w.get("license") or ""))
+            source_name = html.escape(str(w.get("source_name") or SOURCE_NAME))
+            page_no = int(w.get("pdf_page") or 0)
             crc = html.escape(str(w.get("crc32") or ""))
             cards.append(
                 f'<article><img src="../feed/aerospace/slot{slot}.png?v={crc}" alt="{title}">'
                 f'<h3>{title}</h3><p>{report}{(" · " + year) if year else ""}</p>'
-                f'<p class="muted">{lic} · {w.get("ink", "?")}% ink</p>'
-                f'<a href="{source}" rel="noopener">Commons record</a></article>'
+                f'<p class="muted">{source_name}{(" · PDF p. " + str(page_no)) if page_no else ""} · {lic} · {w.get("ink", "?")}% ink</p>'
+                f'<a href="{source}" rel="noopener">Source record</a></article>'
             )
         sections.append(f"<section><h2>{html.escape(CATEGORY_LABELS[cat])}</h2><div class='grid'>{''.join(cards) or '<p>No works selected today.</p>'}</div></section>")
 
@@ -799,7 +1409,7 @@ h1{{font-family:Georgia,serif;font-weight:500;font-size:46px}}h2{{margin-top:42p
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}}article{{background:#fff;border:1px solid #c9ccc7;padding:12px}}
 img{{width:100%;height:auto;background:white;border:1px solid #eee}}h3{{font-family:Georgia,serif;font-weight:500}}.muted{{color:#666}}a{{color:#111}}
 </style></head><body><main><p>PAPER GALLERY</p><h1>Aerospace Drawings</h1>
-<p>Pack {html.escape(pack)} · Wikimedia Commons files verified as Public Domain or CC0.</p>{''.join(sections)}</main></body></html>"""
+<p>Pack {html.escape(pack)} · Wikimedia Commons Public Domain/CC0 plus rights-checked NASA NTRS public-use material.</p>{''.join(sections)}</main></body></html>"""
     (site / "index.html").write_text(page, encoding="utf-8")
 
 
@@ -850,6 +1460,34 @@ def self_test() -> None:
     assert extract_report("Fokker three-view NACA-AC-187") == "NACA-AC-187"
     assert extract_year("1 February 1934") == "1934"
 
+    ntrs_fake = {
+        "id": 19860005739,
+        "distribution": "PUBLIC",
+        "disseminated": "DOCUMENT_AND_METADATA",
+        "downloadsAvailable": True,
+        "copyright": {
+            "determinationType": "GOV_PUBLIC_USE_PERMITTED",
+            "thirdPartyContentCondition": "NOT_SET",
+            "containsThirdPartyMaterial": False,
+        },
+        "exportControl": {"itar": "NO", "ear": "NO"},
+        "downloads": [{
+            "draft": False,
+            "mimetype": "application/pdf",
+            "links": {"pdf": "/api/citations/19860005739/downloads/test.pdf"},
+        }],
+        "reportNumbers": ["NASA-TM-87500"],
+        "publications": [{"publicationDate": "1984-07-01"}],
+    }
+    allowed, rights = ntrs_rights_allowed(ntrs_fake)
+    assert allowed and rights == "GOV_PUBLIC_USE_PERMITTED"
+    assert _ntrs_pdf_link(ntrs_fake).startswith("https://ntrs.nasa.gov/")
+    assert _ntrs_first_report_number(ntrs_fake) == "NASA-TM-87500"
+    assert _ntrs_year(ntrs_fake) == "1984"
+    blocked = dict(ntrs_fake)
+    blocked["copyright"] = dict(ntrs_fake["copyright"], containsThirdPartyMaterial=True)
+    assert not ntrs_rights_allowed(blocked)[0]
+
     fake = Candidate(
         pageid=123,
         file_title="File:Test NACA-AC-187.png",
@@ -885,6 +1523,51 @@ def self_test() -> None:
     packed = pack_1bpp(frame)
     assert len(packed) == FRAME_BYTES
     assert 0.01 < ink < 0.20
+
+    # PDFium smoke test: the NTRS phase depends on rendering report pages.
+    pdf_buf = io.BytesIO()
+    pdf_source = Image.new("RGB", (640, 480), "white")
+    pd = ImageDraw.Draw(pdf_source)
+    pd.rectangle((80, 120, 560, 360), outline="black", width=4)
+    pd.line((80, 240, 560, 240), fill="black", width=3)
+    pdf_source.save(pdf_buf, format="PDF", resolution=120)
+    test_pdf = pdfium.PdfDocument(pdf_buf.getvalue())
+    try:
+        test_page = test_pdf[0]
+        try:
+            test_bitmap = test_page.render(scale=1.0)
+            try:
+                rendered_pdf_page = test_bitmap.to_pil().convert("L").copy()
+            finally:
+                test_bitmap.close()
+        finally:
+            test_page.close()
+    finally:
+        test_pdf.close()
+    assert rendered_pdf_page.width > 100 and rendered_pdf_page.height > 100
+    assert _ntrs_page_score(rendered_pdf_page, "Figure 3. Aircraft configuration", "aircraft-three-views") > 0
+
+
+    # Robust parser and page-selection tests.
+    scalar_report = dict(ntrs_fake)
+    scalar_report["otherReportNumbers"] = "NASA-TM-99999"
+    scalar_report.pop("reportNumbers", None)
+    assert _ntrs_first_report_number(scalar_report) == "NASA-TM-99999"
+    string_false = dict(ntrs_fake)
+    string_false["downloadsAvailable"] = "false"
+    assert not ntrs_rights_allowed(string_false)[0]
+    assert max(_distributed_indices(300, 40)) > 200
+    assert len(_distributed_indices(300, 40)) == 40
+    assert max(_distributed_indices(300, 8)) > 200
+    assert len(_distributed_indices(300, 8)) == 8
+
+    blank_page = Image.new("L", (1000, 1400), 255)
+    technical_page = Image.new("L", (1000, 1400), 255)
+    td = ImageDraw.Draw(technical_page)
+    for yy in (350, 700, 1050):
+        td.rectangle((180, yy - 70, 820, yy + 70), outline=0, width=5)
+        td.line((500, yy - 150, 500, yy + 150), fill=0, width=4)
+    assert _ntrs_page_score(technical_page, "Figure 4. Aircraft configuration", "aircraft-three-views") > _ntrs_page_score(blank_page, "Title", "aircraft-three-views")
 
     # Bit polarity: first black pixel, remaining first byte white.
     test = Image.new("1", (W, H), 1)
